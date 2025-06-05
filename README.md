@@ -1,7 +1,7 @@
 # FujiShader 【富士シェーダー🌋】
 Advanced DEM visualization library.
 - Fast
-- Capable to process GIGABYTES of COG (Cloud Optimized GeoTIFF).
+- Capable to process COG (Cloud Optimized GeoTIFF) in Gigabytes.
 - Some original shading methods
 
 ***!!! Currently in ALPHA !!!***
