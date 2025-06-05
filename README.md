@@ -17,10 +17,11 @@ Classic slope map. Do not use for LatLon Grid.
 ```bash
 FujiShader DEM.tif Slope.tif --algo slope
 ```
-Optional arguments:
-- cellsize: 1.0 by default
-- unit: degrees by default (or percent)
-- treat_nan: None by default
+    Optional arguments:
+    - cellsize: 1.0 by default
+    - unit: degrees by default (or percent)
+    - treat_nan: None by default
+
 ### SkyView Factor
 Classic skyview factor.
 ```bash
