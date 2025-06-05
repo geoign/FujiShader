@@ -17,6 +17,7 @@ The development of QGIS module is in progress.
 Note that none of them are compatible to LatLon Grid... yet.
 
 ### Slope
+![Slope map](images/MtFuji_Slope.jpg)
 Classic slope map.
 ```bash
 FujiShader DEM.tif SLOPE.tif --algo slope
@@ -27,6 +28,7 @@ FujiShader DEM.tif SLOPE.tif --algo slope
     --treat_nan None (Set this to replace NaN)
 
 ### Topographic Position Index
+![TPI map](images/MtFuji_TPI.jpg)
 Classic TPI map.
 ```bash
 FujiShader DEM.tif TPI.tif --algo tpi
