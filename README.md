@@ -3,6 +3,7 @@ Advanced DEM visualization library.
 - Fast
 - Capable to process GIGABYTES of COG (Cloud Optimized GeoTIFF).
 - Some original shading methods
+
 ***!!! Currently in ALPHA version !!!***
 
 ## Installation
