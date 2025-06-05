@@ -1,0 +1,33 @@
+# pyproject.toml (UTF-8 BOMなし)
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "FujiShader"
+version = "0.1.10"
+description = "Terrain shading library with warm-cool, AO, curvature, etc."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+  { name = "Fumihiko IKEGAMI", email = "f.ikegami@gmail.com" }
+]
+keywords = ["terrain", "shading", "GIS", "ambient occlusion", "DEM"]
+
+dependencies = [
+  "numpy>=1.26",
+  "gdal>=3.7"
+]
+
+[project.optional-dependencies]
+extras = ["scipy>=1.10", "numba>=0.59"]
+
+[project.scripts]
+fujishader = "FujiShader.cli.shader_cli:main"
+
+[project.urls]
+Homepage      = "https://github.com/yourusername/FujiShader"
+Documentation = "https://github.com/yourusername/FujiShader#readme"
+"Bug Tracker" = "https://github.com/yourusername/FujiShader/issues"
