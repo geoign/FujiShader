@@ -17,7 +17,7 @@ Note that none of them are compatible to LatLon Grid... yet.
 
 ### Slope
 ![Slope map](images/MtFuji_Slope.jpg)
-Classic slope map.
+Classic slope map. Very fast.
 ```bash
 FujiShader DEM.tif SLOPE.tif --algo slope
 ```
@@ -29,7 +29,7 @@ FujiShader DEM.tif SLOPE.tif --algo slope
 
 ### Topographic Position Index
 ![TPI map](images/MtFuji_TPI.jpg)
-Classic TPI map.
+Classic TPI map. Not very fast.
 ```bash
 FujiShader DEM.tif TPI.tif --algo tpi
 ```
@@ -41,7 +41,7 @@ FujiShader DEM.tif TPI.tif --algo tpi
     
 ### SkyView Factor
 ![Skyview Factor map](images/MtFuji_SVF.jpg)
-Classic skyview factor.
+Classic skyview factor. Very slow.
 ```bash
 FujiShader DEM.tif SVF.tif --algo skyview_factor
 ```
@@ -56,7 +56,7 @@ FujiShader DEM.tif SVF.tif --algo skyview_factor
 
 ### SkyView Factor Fast
 ![SVF Fast map](images/MtFuji_SVF-fast.jpg)
-Pseudo SVF. Not based on the original implementation.
+Pseudo SVF. Not based on the original implementation. Slightly faster.
 ```bash
 FujiShader DEM.tif SVF.tif --algo skyview_factor_fast
 ```
@@ -71,7 +71,7 @@ FujiShader DEM.tif SVF.tif --algo skyview_factor_fast
 
 ### Curvature
 ![Curvature map](images/MtFuji_Curvature.jpg)
-Classic curvature map.
+Classic curvature map. Very fast.
 ```bash
 FujiShader DEM.tif CURVATURE.tif --algo profile_curvature
 FujiShader DEM.tif CURVATURE.tif --algo plan_curvature
@@ -84,7 +84,7 @@ FujiShader DEM.tif CURVATURE.tif --algo total_curvature
 
 ### Openness
 ![Openness map](images/MtFuji_ON1.jpg)
-Classic openness map based on Yokoyama et al. (2002).
+Classic openness map based on Yokoyama et al. (2002). Very slow.
 ```bash
 FujiShader DEM.tif CURVATURE.tif --algo positive_openness
 FujiShader DEM.tif CURVATURE.tif --algo negative_openness
@@ -122,7 +122,7 @@ FujiShader DEM.tif RV.tif --algo multi_scale_boxgauss
 
 ### RidgeVolley - TopoUSM method
 ![RidgeVolley map by TopoUSM method](images/MtFuji_RV3.jpg)
-Highlights ridges and shadows volleys. Slow implementation by myself.
+Highlights ridges and shadows volleys. "Slower for quality" implementation by myself.
 ```bash
 FujiShader DEM.tif RV.tif --algo multi_scale_usm
 ```
