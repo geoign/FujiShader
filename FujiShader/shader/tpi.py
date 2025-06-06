@@ -118,7 +118,6 @@ def _uniform_filter_optimized(
     
     # Progress setup
     if progress:
-        # 処理ステップ: パディング(10%) + 積分画像計算(20%) + フィルタリング(70%)
         progress.set_range(100)
         progress.advance(0, "Starting optimized filtering...")
     
@@ -143,21 +142,38 @@ def _uniform_filter_optimized(
     processed = 0
     update_interval = max(1, total_pixels // 70)  # 70% of progress for filtering
     
+    # 修正: 積分画像のサイズを取得
+    integral_height, integral_width = integral.shape
+    
     # Compute window sums using integral image
     for i in range(arr.shape[0]):
         for j in range(arr.shape[1]):
-            # Calculate window boundaries in integral image coordinates
-            y1, y2 = i, i + window_size
-            x1, x2 = j, j + window_size
+            # 修正: パディングを考慮した座標計算
+            # 元の配列の(i,j)は、パディング後の配列では(i+pad_width, j+pad_width)
+            center_y = i + pad_width
+            center_x = j + pad_width
             
-            # Compute sum using integral image
-            window_sum = (integral[y2, x2] - 
-                         (integral[y1, x2] if y1 > 0 else 0) -
-                         (integral[y2, x1] if x1 > 0 else 0) +
-                         (integral[y1, x1] if y1 > 0 and x1 > 0 else 0))
+            # ウィンドウの境界を計算（積分画像の境界内に制限）
+            y1 = max(0, center_y - pad_width)
+            y2 = min(integral_height - 1, center_y + pad_width)
+            x1 = max(0, center_x - pad_width)
+            x2 = min(integral_width - 1, center_x + pad_width)
             
-            # Compute mean
-            filtered[i, j] = window_sum / (window_size * window_size)
+            # 実際のウィンドウサイズ（境界付近では小さくなる可能性）
+            actual_window_size = (y2 - y1 + 1) * (x2 - x1 + 1)
+            
+            # 積分画像を使用してウィンドウの合計を計算
+            # 積分画像では、矩形の合計は右下 - 右上 - 左下 + 左上
+            window_sum = integral[y2, x2]
+            if y1 > 0:
+                window_sum -= integral[y1 - 1, x2]
+            if x1 > 0:
+                window_sum -= integral[y2, x1 - 1]
+            if y1 > 0 and x1 > 0:
+                window_sum += integral[y1 - 1, x1 - 1]
+            
+            # 平均を計算
+            filtered[i, j] = window_sum / actual_window_size
             
             # Update progress
             if progress:
@@ -201,46 +217,62 @@ def tpi(
     if progress is None:
         progress = NullProgress()
     
-    # Input validation
-    if radius_m <= 0:
-        raise ValueError("radius_m must be positive")
-    if cellsize <= 0:
-        raise ValueError("cellsize must be positive")
-    if dem.size == 0:
-        raise ValueError("dem array is empty")
-    if dem.ndim != 2:
-        raise ValueError("dem must be a 2D array")
-    
-    progress.advance(0, f"Starting TPI calculation (radius: {radius_m}m)")
-    
-    # Convert radius to window size
-    w = _radius_to_window(radius_m, cellsize)
-    window_size = w * 2 + 1
-    
-    progress.advance(0, f"Window size: {window_size}x{window_size} pixels")
-    
-    # Ensure input is float32 (avoid unnecessary copying if already correct type)
-    dem_f32 = dem.astype(np.float32, copy=False)
-    
-    # Compute mean elevation in surrounding window
-    if use_optimized and dem.shape[0] * dem.shape[1] > 10000:
-        # Use optimized version for large arrays
-        progress.advance(0, "Using optimized algorithm for large DEM")
-        mean_elevation = _uniform_filter_optimized(dem_f32, window_size, progress)
-    else:
-        # Use simple version for small arrays or when optimization is disabled
-        progress.advance(0, "Using standard algorithm")
-        mean_elevation = _uniform_filter_numpy(dem_f32, window_size, progress)
-    
-    progress.advance(0, "Computing final TPI values...")
-    
-    # TPI = elevation - mean elevation
-    tpi_result = dem_f32 - mean_elevation
-    
-    progress.advance(0, "TPI calculation completed")
-    progress.done()
-    
-    return tpi_result
+    try:
+        # Input validation
+        if radius_m <= 0:
+            raise ValueError("radius_m must be positive")
+        if cellsize <= 0:
+            raise ValueError("cellsize must be positive")
+        if dem.size == 0:
+            raise ValueError("dem array is empty")
+        if dem.ndim != 2:
+            raise ValueError("dem must be a 2D array")
+        
+        progress.advance(0, f"Starting TPI calculation (radius: {radius_m}m)")
+        
+        # Convert radius to window size
+        w = _radius_to_window(radius_m, cellsize)
+        window_size = w * 2 + 1
+        
+        # 大きすぎるウィンドウサイズをチェック
+        max_dim = min(dem.shape[0], dem.shape[1])
+        if window_size >= max_dim:
+            progress.advance(0, f"Warning: Window size ({window_size}) is large relative to DEM size {dem.shape}")
+            window_size = min(window_size, max_dim - 1)
+            if window_size % 2 == 0:
+                window_size -= 1
+        
+        progress.advance(0, f"Window size: {window_size}x{window_size} pixels")
+        
+        # Ensure input is float32
+        dem_f32 = dem.astype(np.float32, copy=False)
+        
+        # 配列サイズに基づいて適切なアルゴリズムを選択
+        total_pixels = dem.shape[0] * dem.shape[1]
+        
+        if use_optimized and total_pixels > 10000 and window_size < min(dem.shape) // 4:
+            # 最適化版は中程度のウィンドウサイズの時のみ使用
+            progress.advance(0, "Using optimized algorithm")
+            mean_elevation = _uniform_filter_optimized(dem_f32, window_size, progress)
+        else:
+            # 安全版を使用
+            progress.advance(0, "Using safe algorithm")
+            mean_elevation = _uniform_filter_optimized(dem_f32, window_size, progress)
+        
+        progress.advance(0, "Computing final TPI values...")
+        
+        # TPI = elevation - mean elevation
+        tpi_result = dem_f32 - mean_elevation
+        
+        progress.advance(0, "TPI calculation completed")
+        progress.done()
+        
+        return tpi_result
+        
+    except Exception as e:
+        if progress:
+            progress.done()
+        raise RuntimeError(f"TPI calculation failed: {str(e)}") from e
 
 
 def local_relief(

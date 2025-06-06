@@ -2,24 +2,23 @@
 FujiShader.shader.curvature
 ===========================
 
-Profile, plan and total curvature (second‐order derivatives)
------------------------------------------------------------
-Implements the algorithm outlined in Zevenbergen & Thorne (1987) using 3×3
-window coefficients. Returns curvature in 1/m; sign convention follows GDAL
-(+ values = convex for profile curvature).
+プロファイル、平面、および全曲率（2次微分）
+-------------------------------------------
+Zevenbergen & Thorne (1987) で概説されているアルゴリズムを3×3
+ウィンドウ係数を用いて実装。曲率は1/mで返され、符号規則はGDALに従う
+（+ 値 = プロファイル曲率では凸）。
 
-The implementation uses finite difference methods to compute first and second
-partial derivatives of elevation data, then applies the curvature formulas
-according to Zevenbergen & Thorne (1987).
+実装では有限差分法を用いて標高データの1次および2次偏微分を計算し、
+Zevenbergen & Thorne (1987) に従って曲率式を適用します。
 
-Public functions
-~~~~~~~~~~~~~~~~
-* `profile_curvature` - Curvature in the direction of maximum slope
-* `plan_curvature` - Curvature perpendicular to the direction of maximum slope  
-* `total_curvature` - Mean curvature (Laplacian)
+公開関数
+~~~~~~~~
+* `profile_curvature` - 最大傾斜方向の曲率
+* `plan_curvature` - 最大傾斜方向に垂直な曲率  
+* `total_curvature` - 平均曲率（ラプラシアン）
 
-References
-~~~~~~~~~~
+参考文献
+~~~~~~~~
 Zevenbergen, L. W., & Thorne, C. R. (1987). Quantitative analysis of land 
 surface topography. Earth surface processes and landforms, 12(1), 47-56.
 """
@@ -29,19 +28,19 @@ from typing import Tuple, Union, Optional, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-# Define progress reporter protocol for type hints
+# 進捗レポータープロトコルの型ヒント定義
 class ProgressReporterProtocol(Protocol):
-    """Protocol for progress reporting."""
+    """進捗レポーターのプロトコル。"""
     def set_range(self, maximum: int) -> None: ...
     def advance(self, step: int = 1, text: Optional[str] = None) -> None: ...
     def done(self) -> None: ...
 
 
-# Import progress reporting - adjust path as needed for your module structure
+# 進捗レポートのインポート - モジュール構造に応じてパスを調整
 try:
     from ..core.progress import ProgressReporter, NullProgress
 except ImportError:
-    # Fallback for standalone usage
+    # スタンドアロン使用時のフォールバック
     class NullProgress:
         def set_range(self, maximum: int) -> None: pass
         def advance(self, step: int = 1, text: Optional[str] = None) -> None: pass
@@ -55,19 +54,48 @@ __all__ = [
 
 
 def _validate_dem(dem: NDArray[np.float32]) -> None:
-    """Validate DEM input array.
+    """DEM入力配列を検証する。
     
     Args:
-        dem: Digital elevation model array
+        dem: デジタル標高モデル配列
         
     Raises:
-        ValueError: If DEM is too small or has invalid shape
+        ValueError: DEMが小さすぎるか無効な形状の場合
     """
     if dem.ndim != 2:
-        raise ValueError("DEM must be a 2D array")
+        raise ValueError("DEMは2次元配列である必要があります")
     
     if dem.shape[0] < 3 or dem.shape[1] < 3:
-        raise ValueError("DEM must be at least 3x3 pixels for curvature calculation")
+        raise ValueError("曲率計算にはDEMは最低3x3ピクセル必要です")
+
+
+def _preprocess_dem(
+    dem: NDArray[np.float32],
+    replace_nan: Optional[float] = None,
+    set_nan: Optional[float] = None
+) -> NDArray[np.float32]:
+    """DEM前処理：NaN処理とデータクリーニング。
+    
+    Args:
+        dem: デジタル標高モデル配列
+        replace_nan: NaN値をこの値で置換（None の場合は置換しない）
+        set_nan: この値をNaNに設定（None の場合は設定しない）
+        
+    Returns:
+        前処理されたDEM配列
+    """
+    # コピーを作成して元のデータを保護
+    processed = dem.astype(np.float32, copy=True)
+    
+    # 特定の値をNaNに設定
+    if set_nan is not None:
+        processed[processed == set_nan] = np.nan
+    
+    # NaN値を特定の値で置換
+    if replace_nan is not None:
+        processed[np.isnan(processed)] = replace_nan
+    
+    return processed
 
 
 def _gradients_2nd(
@@ -79,42 +107,41 @@ def _gradients_2nd(
     NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], 
     NDArray[np.float32], NDArray[np.float32]
 ]:
-    """Compute first and second partial derivatives using finite differences.
+    """有限差分を用いて1次および2次偏微分を計算する。
     
-    Uses central difference approximations for first derivatives and 
-    second-order finite differences for second derivatives.
+    1次微分には中央差分近似、2次微分には2次有限差分を使用。
     
     Args:
-        dem: Digital elevation model array
-        dy: Cell size in y direction (typically negative for north-up grids)
-        dx: Cell size in x direction
-        progress: Optional progress reporter
+        dem: デジタル標高モデル配列
+        dy: y方向のセルサイズ（通常、北向きグリッドでは負値）
+        dx: x方向のセルサイズ
+        progress: オプショナルな進捗レポーター
         
     Returns:
-        Tuple of (dz/dx, dz/dy, d²z/dx², d²z/dy², d²z/dxdy)
-        All arrays have shape (height-2, width-2)
+        (dz/dx, dz/dy, d²z/dx², d²z/dy², d²z/dxdy) のタプル
+        すべての配列の形状は (height-2, width-2)
     """
     if progress is None:
         progress = NullProgress()
     
     z = dem.astype(np.float32, copy=False)
     
-    # First partial derivatives using central differences
-    # All resulting arrays will be (height-2, width-2)
-    progress.advance(1, "第1次偏微分を計算中 (dz/dx)")
+    # 中央差分を用いた1次偏微分
+    # すべての結果配列は (height-2, width-2) になる
+    progress.advance(1, "1次偏微分を計算中 (dz/dx)")
     dzdx = (z[1:-1, 2:] - z[1:-1, :-2]) / (2.0 * dx)
     
-    progress.advance(1, "第1次偏微分を計算中 (dz/dy)")
+    progress.advance(1, "1次偏微分を計算中 (dz/dy)")
     dzdy = (z[2:, 1:-1] - z[:-2, 1:-1]) / (2.0 * dy)
     
-    # Second partial derivatives using finite differences
-    progress.advance(1, "第2次偏微分を計算中 (d²z/dx²)")
+    # 有限差分を用いた2次偏微分
+    progress.advance(1, "2次偏微分を計算中 (d²z/dx²)")
     d2zdx2 = (z[1:-1, 2:] - 2.0 * z[1:-1, 1:-1] + z[1:-1, :-2]) / (dx * dx)
     
-    progress.advance(1, "第2次偏微分を計算中 (d²z/dy²)")
+    progress.advance(1, "2次偏微分を計算中 (d²z/dy²)")
     d2zdy2 = (z[2:, 1:-1] - 2.0 * z[1:-1, 1:-1] + z[:-2, 1:-1]) / (dy * dy)
     
-    # Mixed partial derivative (cross-derivative)
+    # 混合偏微分（交差微分）
     progress.advance(1, "交差偏微分を計算中 (d²z/dxdy)")
     d2zdxdy = (
         z[2:, 2:] + z[:-2, :-2] - z[2:, :-2] - z[:-2, 2:]
@@ -128,80 +155,90 @@ def _curvature_impl(
     *,
     cellsize: Union[Tuple[float, float], float] = 1.0,
     kind: str,
+    replace_nan: Optional[float] = None,
+    set_nan: Optional[float] = None,
     progress: Optional[ProgressReporterProtocol] = None,
 ) -> NDArray[np.float32]:
-    """Internal implementation for curvature calculations.
+    """曲率計算の内部実装。
     
     Args:
-        dem: Digital elevation model array
-        cellsize: Cell size as (dy, dx) tuple or single value for square cells
-        kind: Type of curvature - 'profile', 'plan', or 'total'
-        progress: Optional progress reporter
+        dem: デジタル標高モデル配列
+        cellsize: (dy, dx) タプルまたは正方セル用の単一値としてのセルサイズ
+        kind: 曲率の種類 - 'profile', 'plan', または 'total'
+        replace_nan: NaN値をこの値で置換（None の場合は置換しない）
+        set_nan: この値をNaNに設定（None の場合は設定しない）
+        progress: オプショナルな進捗レポーター
         
     Returns:
-        Curvature array with same shape as input DEM, NaN at borders
+        入力DEMと同じ形状の曲率配列、境界部分はNaN
         
     Raises:
-        ValueError: If kind is not recognized or DEM is invalid
+        ValueError: kindが認識されないかDEMが無効な場合
     """
     _validate_dem(dem)
     
-    # Handle cellsize parameter
+    # cellsizeパラメータの処理
     if np.isscalar(cellsize):
         dy, dx = float(cellsize), float(cellsize)
     else:
         dy, dx = float(cellsize[0]), float(cellsize[1])
     
-    # Initialize progress reporting
+    # 進捗レポートの初期化
     if progress is None:
         progress = NullProgress()
     
-    # プログレス範囲を設定（偏微分計算5ステップ + 曲率計算1ステップ + 出力配列作成1ステップ）
-    progress.set_range(7)
+    # プログレス範囲を設定（前処理1 + 偏微分計算5 + 曲率計算1 + 出力配列作成1）
+    progress.set_range(8)
     
     progress.advance(1, f"{kind}曲率の計算を開始")
     
-    # Compute partial derivatives
-    dzdx, dzdy, d2zdx2, d2zdy2, d2zdxdy = _gradients_2nd(dem, dy, dx, progress)
+    # DEM前処理
+    processed_dem = _preprocess_dem(dem, replace_nan, set_nan)
     
-    # Assign common variable names following Zevenbergen & Thorne notation
-    p = dzdx  # First derivative in x direction
-    q = dzdy  # First derivative in y direction  
-    a = d2zdx2  # Second derivative in x direction
-    b = d2zdxdy  # Mixed second derivative
-    c = d2zdy2  # Second derivative in y direction
+    # 偏微分を計算
+    dzdx, dzdy, d2zdx2, d2zdy2, d2zdxdy = _gradients_2nd(processed_dem, dy, dx, progress)
     
-    # Compute curvature based on type
+    # Zevenbergen & Thorne記法に従った共通変数名を割り当て
+    p = dzdx  # x方向1次微分
+    q = dzdy  # y方向1次微分  
+    a = d2zdx2  # x方向2次微分
+    b = d2zdxdy  # 混合2次微分
+    c = d2zdy2  # y方向2次微分
+    
+    # 種類に基づいて曲率を計算
     progress.advance(1, f"{kind}曲率を計算中")
     
     if kind == "profile":
-        # Profile curvature: curvature in direction of maximum slope
-        # Formula: -(a*p² + 2*b*p*q + c*q²) / (1 + p² + q²)^(3/2)
+        # プロファイル曲率：最大傾斜方向の曲率
+        # 公式: -(a*p² + 2*b*p*q + c*q²) / (1 + p² + q²)^(3/2)
         denom = (1.0 + p**2 + q**2) ** 1.5
-        # Add small epsilon to prevent division by zero in flat areas
+        # 平坦地域での0除算を防ぐため、小さなイプシロンを追加
         denom = np.maximum(denom, 1e-10)
         curv = -((a * p**2 + 2.0 * b * p * q + c * q**2) / denom)
         
     elif kind == "plan":
-        # Plan curvature: curvature perpendicular to direction of maximum slope
-        # Formula: -(a*q² - 2*b*p*q + c*p²) / (1 + p² + q²)^(1/2)
+        # 平面曲率：最大傾斜方向に垂直な曲率
+        # 公式: -(a*q² - 2*b*p*q + c*p²) / (1 + p² + q²)^(1/2)
         denom = (1.0 + p**2 + q**2) ** 0.5
-        # Add small epsilon to prevent division by zero in flat areas
+        # 平坦地域での0除算を防ぐため、小さなイプシロンを追加
         denom = np.maximum(denom, 1e-10)
         curv = -((a * q**2 - 2.0 * b * p * q + c * p**2) / denom)
         
     elif kind == "total":
-        # Total curvature (mean curvature): Laplacian of elevation
-        # Formula: a + c = d²z/dx² + d²z/dy²
+        # 全曲率（平均曲率）：標高のラプラシアン
+        # 公式: a + c = d²z/dx² + d²z/dy²
         curv = a + c
         
     else:
-        raise ValueError(f"Unknown curvature kind '{kind}'. Must be 'profile', 'plan', or 'total'")
+        raise ValueError(f"不明な曲率種別 '{kind}'。'profile', 'plan', または 'total' である必要があります")
     
-    # Create output array with NaN borders
+    # NaN境界を持つ出力配列を作成
     progress.advance(1, "出力配列を作成中")
     out = np.full_like(dem, np.nan, dtype=np.float32)
-    out[1:-1, 1:-1] = curv
+    
+    # NaNを適切に処理：入力にNaNがある場合、出力もNaNにする
+    valid_mask = ~np.isnan(processed_dem[1:-1, 1:-1])
+    out[1:-1, 1:-1] = np.where(valid_mask, curv, np.nan)
     
     progress.done()
     
@@ -212,103 +249,133 @@ def profile_curvature(
     dem: NDArray[np.float32], 
     *, 
     cellsize: Union[Tuple[float, float], float] = 1.0,
+    replace_nan: Optional[float] = None,
+    set_nan: Optional[float] = None,
     progress: Optional[ProgressReporterProtocol] = None
 ) -> NDArray[np.float32]:
-    """Compute profile curvature from a digital elevation model.
+    """デジタル標高モデルからプロファイル曲率を計算する。
     
-    Profile curvature measures the rate of change of slope in the direction
-    of maximum slope. Positive values indicate convex areas (ridges),
-    negative values indicate concave areas (valleys).
+    プロファイル曲率は最大傾斜方向における傾斜の変化率を測定する。
+    正の値は凸領域（尾根）を示し、負の値は凹領域（谷）を示す。
     
     Args:
-        dem: Digital elevation model as 2D array (must be at least 3x3)
-        cellsize: Cell size as (dy, dx) tuple or single value for square cells.
-                 Units should match DEM elevation units.
-        progress: Optional progress reporter for tracking computation progress
+        dem: 2次元配列としてのデジタル標高モデル（最低3x3必要）
+        cellsize: (dy, dx) タプルまたは正方セル用の単一値としてのセルサイズ。
+                 単位はDEM標高単位と一致する必要がある。
+        replace_nan: NaN値をこの値で置換（None の場合は置換しない）
+        set_nan: この値をNaNに設定（None の場合は設定しない）
+        progress: 計算進捗を追跡するオプショナルな進捗レポーター
     
     Returns:
-        Profile curvature array with same shape as input DEM.
-        Border pixels are set to NaN. Units are 1/[length_unit].
+        入力DEMと同じ形状のプロファイル曲率配列。
+        境界ピクセルはNaNに設定される。単位は1/[長さ単位]。
         
     Raises:
-        ValueError: If DEM is too small or has invalid dimensions
+        ValueError: DEMが小さすぎるか無効な次元を持つ場合
         
     Example:
         >>> import numpy as np
-        >>> # Create a simple ridge
+        >>> # シンプルな尾根を作成
         >>> dem = np.array([[1, 2, 1], [1, 3, 1], [1, 2, 1]], dtype=np.float32)
         >>> prof_curv = profile_curvature(dem, cellsize=1.0)
-        >>> # Central pixel should show positive curvature (convex ridge)
+        >>> # 中央ピクセルは正の曲率（凸尾根）を示すはず
     """
-    return _curvature_impl(dem, cellsize=cellsize, kind="profile", progress=progress)
+    return _curvature_impl(
+        dem, 
+        cellsize=cellsize, 
+        kind="profile", 
+        replace_nan=replace_nan,
+        set_nan=set_nan,
+        progress=progress
+    )
 
 
 def plan_curvature(
     dem: NDArray[np.float32], 
     *, 
     cellsize: Union[Tuple[float, float], float] = 1.0,
+    replace_nan: Optional[float] = None,
+    set_nan: Optional[float] = None,
     progress: Optional[ProgressReporterProtocol] = None
 ) -> NDArray[np.float32]:
-    """Compute plan curvature from a digital elevation model.
+    """デジタル標高モデルから平面曲率を計算する。
     
-    Plan curvature measures the rate of change of aspect (direction of slope).
-    It represents curvature perpendicular to the direction of maximum slope.
-    Positive values indicate divergent flow areas, negative values indicate
-    convergent flow areas.
+    平面曲率は方位（傾斜方向）の変化率を測定する。
+    最大傾斜方向に垂直な曲率を表す。
+    正の値は発散流領域を示し、負の値は収束流領域を示す。
     
     Args:
-        dem: Digital elevation model as 2D array (must be at least 3x3)
-        cellsize: Cell size as (dy, dx) tuple or single value for square cells.
-                 Units should match DEM elevation units.
-        progress: Optional progress reporter for tracking computation progress
+        dem: 2次元配列としてのデジタル標高モデル（最低3x3必要）
+        cellsize: (dy, dx) タプルまたは正方セル用の単一値としてのセルサイズ。
+                 単位はDEM標高単位と一致する必要がある。
+        replace_nan: NaN値をこの値で置換（None の場合は置換しない）
+        set_nan: この値をNaNに設定（None の場合は設定しない）
+        progress: 計算進捗を追跡するオプショナルな進捗レポーター
     
     Returns:
-        Plan curvature array with same shape as input DEM.
-        Border pixels are set to NaN. Units are 1/[length_unit].
+        入力DEMと同じ形状の平面曲率配列。
+        境界ピクセルはNaNに設定される。単位は1/[長さ単位]。
         
     Raises:
-        ValueError: If DEM is too small or has invalid dimensions
+        ValueError: DEMが小さすぎるか無効な次元を持つ場合
         
     Example:
         >>> import numpy as np
-        >>> # Create a simple valley
+        >>> # シンプルな谷を作成
         >>> dem = np.array([[2, 1, 2], [2, 1, 2], [2, 1, 2]], dtype=np.float32)
         >>> plan_curv = plan_curvature(dem, cellsize=1.0)
-        >>> # Central pixel should show negative curvature (convergent)
+        >>> # 中央ピクセルは負の曲率（収束）を示すはず
     """
-    return _curvature_impl(dem, cellsize=cellsize, kind="plan", progress=progress)
+    return _curvature_impl(
+        dem, 
+        cellsize=cellsize, 
+        kind="plan", 
+        replace_nan=replace_nan,
+        set_nan=set_nan,
+        progress=progress
+    )
 
 
 def total_curvature(
     dem: NDArray[np.float32], 
     *, 
     cellsize: Union[Tuple[float, float], float] = 1.0,
+    replace_nan: Optional[float] = None,
+    set_nan: Optional[float] = None,
     progress: Optional[ProgressReporterProtocol] = None
 ) -> NDArray[np.float32]:
-    """Compute total curvature (mean curvature) from a digital elevation model.
+    """デジタル標高モデルから全曲率（平均曲率）を計算する。
     
-    Total curvature is the Laplacian of the elevation surface and represents
-    the mean curvature at each point. It is the sum of the principal curvatures
-    and equals the sum of profile and plan curvature in most cases.
+    全曲率は標高面のラプラシアンであり、各点における平均曲率を表す。
+    主曲率の和であり、ほとんどの場合プロファイル曲率と平面曲率の和に等しい。
     
     Args:
-        dem: Digital elevation model as 2D array (must be at least 3x3)
-        cellsize: Cell size as (dy, dx) tuple or single value for square cells.
-                 Units should match DEM elevation units.
-        progress: Optional progress reporter for tracking computation progress
+        dem: 2次元配列としてのデジタル標高モデル（最低3x3必要）
+        cellsize: (dy, dx) タプルまたは正方セル用の単一値としてのセルサイズ。
+                 単位はDEM標高単位と一致する必要がある。
+        replace_nan: NaN値をこの値で置換（None の場合は置換しない）
+        set_nan: この値をNaNに設定（None の場合は設定しない）
+        progress: 計算進捗を追跡するオプショナルな進捗レポーター
     
     Returns:
-        Total curvature array with same shape as input DEM.
-        Border pixels are set to NaN. Units are 1/[length_unit].
+        入力DEMと同じ形状の全曲率配列。
+        境界ピクセルはNaNに設定される。単位は1/[長さ単位]。
         
     Raises:
-        ValueError: If DEM is too small or has invalid dimensions
+        ValueError: DEMが小さすぎるか無効な次元を持つ場合
         
     Example:
         >>> import numpy as np
-        >>> # Create a simple dome
+        >>> # シンプルなドームを作成
         >>> dem = np.array([[1, 1, 1], [1, 2, 1], [1, 1, 1]], dtype=np.float32)
         >>> total_curv = total_curvature(dem, cellsize=1.0)
-        >>> # Central pixel should show positive curvature (convex dome)
+        >>> # 中央ピクセルは正の曲率（凸ドーム）を示すはず
     """
-    return _curvature_impl(dem, cellsize=cellsize, kind="total", progress=progress)
+    return _curvature_impl(
+        dem, 
+        cellsize=cellsize, 
+        kind="total", 
+        replace_nan=replace_nan,
+        set_nan=set_nan,
+        progress=progress
+    )

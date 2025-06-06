@@ -2,26 +2,25 @@
 FujiShader.shader.sunsky
 ========================
 
-Physically‐inspired *directional* illumination models (QGIS optimized)
----------------------------------------------------------------------
-This module introduces two complementary shading functions:
+物理ベースの*方向性*照明モデル（QGIS最適化版）
+---------------------------------------------
+このモジュールは2つの補完的なシェーディング関数を提供します：
 
-* **`direct_light`** – strict Lambertian hillshade with **optional cast
-  shadows** for a single solar position (azimuth, altitude).
-* **`sky_light`** – hemispherical skylight integral using a discrete set of
-  azimuths; essentially *direction‐weighted SVF*.
+* **`direct_light`** – 太陽位置（方位角、高度角）に基づく厳密なランベルト山岳陰影に
+  **オプションの落影**を含む
+* **`sky_light`** – 離散的な方位角セットを使用した半球天空光積分；
+  本質的には*方向重み付きSVF*
 
-Both return *irradiance weights* in the range **[0–1]** so they can be fed
-into colour pipelines (e.g. warm–cool compositing) or multiplied with
-reflectance maps.
+両方とも**[0–1]**範囲の*放射照度重み*を返すため、カラーパイプライン
+（例：暖色–寒色合成）に供給したり、反射率マップと乗算したりできます。
 
-Design choices
-~~~~~~~~~~~~~~
-* Same *cellsize / max_radius / n_directions* parameters as other FujiShader
-  modules → consistent UX.
-* Pure NumPy implementation optimized for QGIS environments.
-* Cast‐shadow routine uses vectorized operations for better performance.
-* Memory-efficient implementation suitable for large DEMs.
+設計方針
+~~~~~~~~
+* 他のFujiShaderモジュールと同じ*cellsize / max_radius / n_directions*パラメータ
+  → 一貫したUX
+* QGIS環境に最適化されたピュアNumPy実装
+* 落影ルーチンはより良いパフォーマンスのためにベクトル化演算を使用
+* 大容量DEMに適したメモリ効率的な実装
 """
 from __future__ import annotations
 
@@ -36,29 +35,79 @@ from ..core.progress import ProgressReporter, NullProgress
 __all__ = ["direct_light", "sky_light"]
 
 # -----------------------------------------------------------------------------
-# Helper: gradient → unit normal (optimized)
+# ヘルパー: 勾配 → 単位法線ベクトル（最適化版）
 # -----------------------------------------------------------------------------
 
 def _unit_normals(dem: NDArray[np.float32], dy: float, dx: float) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
-    """Return (nx, ny, nz) unit surface normals via central differences.
+    """中央差分による(nx, ny, nz)単位面法線ベクトルを返す。
     
-    Optimized for memory efficiency and speed in QGIS environments.
+    QGIS環境でのメモリ効率とスピードに最適化済み。
     """
-    # Use numpy gradient with edge_order=1 for better edge handling
+    # エッジ処理改善のためnumpy gradientを使用（edge_order=1）
     dz_dy, dz_dx = np.gradient(dem, dy, dx, edge_order=1)
     
-    # Compute magnitude once and reuse
+    # 大きさを一度計算して再利用
     mag_sq = dz_dx * dz_dx + dz_dy * dz_dy + 1.0
-    nz = np.reciprocal(np.sqrt(mag_sq))  # Slightly faster than 1.0 / sqrt
+    nz = np.reciprocal(np.sqrt(mag_sq))  # 1.0 / sqrtより若干高速
     
-    # Compute normals
+    # 法線ベクトルを計算
     nx = -dz_dx * nz
     ny = -dz_dy * nz
     
     return nx.astype(np.float32, copy=False), ny.astype(np.float32, copy=False), nz.astype(np.float32, copy=False)
 
 # -----------------------------------------------------------------------------
-# Vectorized cast‐shadow computation
+# NaN値処理ヘルパー
+# -----------------------------------------------------------------------------
+
+def _process_nan_values(
+    dem: NDArray[np.float32], 
+    set_nan: Optional[float] = None, 
+    replace_nan: Optional[float] = None
+) -> Tuple[NDArray[np.float32], NDArray[np.bool_]]:
+    """
+    DEM配列のNaN値処理を行う
+    
+    Parameters
+    ----------
+    dem : NDArray[np.float32]
+        入力DEM配列
+    set_nan : float, optional
+        この値をNaNに設定する
+    replace_nan : float, optional
+        NaN値をこの値で一時的に置換する（計算用）
+        
+    Returns
+    -------
+    processed_dem : NDArray[np.float32]
+        処理済みDEM配列
+    original_nan_mask : NDArray[np.bool_]
+        元のNaN位置のマスク（結果復元用）
+    """
+    # float32にコピー
+    processed_dem = dem.astype(np.float32, copy=True)
+    
+    # 元のNaN位置を記録
+    original_nan_mask = np.isnan(processed_dem)
+    
+    # 指定値をNaNに設定
+    if set_nan is not None:
+        set_nan_mask = np.isclose(processed_dem, set_nan, equal_nan=False)
+        if np.any(set_nan_mask):
+            processed_dem[set_nan_mask] = np.nan
+            # マスクを更新
+            original_nan_mask = original_nan_mask | set_nan_mask
+    
+    # replace_nan処理：NaN値を一時的に置換
+    if replace_nan is not None:
+        current_nan_mask = np.isnan(processed_dem)
+        if np.any(current_nan_mask):
+            processed_dem[current_nan_mask] = replace_nan
+    
+    return processed_dem, original_nan_mask
+
+# -----------------------------------------------------------------------------
+# ベクトル化落影計算
 # -----------------------------------------------------------------------------
 
 def _compute_shadow_mask_vectorized(
@@ -73,10 +122,10 @@ def _compute_shadow_mask_vectorized(
     progress: Optional[ProgressReporter] = None
 ) -> NDArray[np.bool_]:
     """
-    Vectorized shadow computation using chunked processing for memory efficiency.
+    メモリ効率のためのチャンク処理を使用したベクトル化影計算
     
-    This approach processes pixels in chunks to balance memory usage and performance,
-    making it suitable for large DEMs in QGIS.
+    このアプローチはメモリ使用量とパフォーマンスのバランスを取るため
+    ピクセルをチャンクで処理し、QGISでの大容量DEMに適しています。
     """
     h, w = dem.shape
     shadow_mask = np.zeros((h, w), dtype=np.bool_)
@@ -84,15 +133,15 @@ def _compute_shadow_mask_vectorized(
     if progress is None:
         progress = NullProgress()
     
-    # Pre-compute step vectors for efficiency
+    # 効率化のためステップベクトルを事前計算
     step_dx = -cos_az * np.arange(1, max_steps + 1)
     step_dy = -sin_az * np.arange(1, max_steps + 1)
     
-    # Process in chunks to manage memory
+    # メモリ管理のためチャンクで処理
     total_pixels = h * w
     total_chunks = (total_pixels + chunk_size - 1) // chunk_size
     
-    # Set up progress reporting
+    # 進捗レポート設定
     progress.set_range(total_chunks * max_steps)
     processed_operations = 0
     
@@ -100,27 +149,27 @@ def _compute_shadow_mask_vectorized(
         chunk_end = min(chunk_start + chunk_size, total_pixels)
         chunk_indices = np.arange(chunk_start, chunk_end)
         
-        # Convert flat indices to 2D coordinates
+        # 平坦インデックスを2D座標に変換
         y_coords = chunk_indices // w
         x_coords = chunk_indices % w
         
-        # Get elevation at current positions
+        # 現在位置での標高を取得
         z0 = dem[y_coords, x_coords]
         
-        # Check each step for this chunk
+        # このチャンクの各ステップを確認
         for step_idx in range(max_steps):
             dx_step = step_dx[step_idx]
             dy_step = step_dy[step_idx]
             
-            # Calculate target positions
+            # ターゲット位置を計算
             xx = x_coords + dx_step
             yy = y_coords + dy_step
             
-            # Check bounds
+            # 境界チェック
             valid_mask = (xx >= 0) & (yy >= 0) & (xx < w - 1) & (yy < h - 1)
             
             if np.any(valid_mask):
-                # Get integer and fractional parts for interpolation
+                # 補間用の整数部と小数部を取得
                 xx_valid = xx[valid_mask]
                 yy_valid = yy[valid_mask]
                 ix = np.floor(xx_valid).astype(np.int32)
@@ -128,11 +177,11 @@ def _compute_shadow_mask_vectorized(
                 fx = xx_valid - ix
                 fy = yy_valid - iy
                 
-                # Ensure indices are within bounds
+                # インデックスが境界内であることを確認
                 ix = np.clip(ix, 0, w - 2)
                 iy = np.clip(iy, 0, h - 2)
                 
-                # Bilinear interpolation
+                # バイリニア補間
                 z_interp = (
                     dem[iy, ix] * (1 - fx) * (1 - fy) +
                     dem[iy, ix + 1] * fx * (1 - fy) +
@@ -140,31 +189,31 @@ def _compute_shadow_mask_vectorized(
                     dem[iy + 1, ix + 1] * fx * fy
                 )
                 
-                # Calculate horizontal distance and elevation angle
+                # 水平距離と仰角を計算
                 horiz_dist = np.sqrt(
                     (dx * (x_coords[valid_mask] - xx_valid)) ** 2 +
                     (dy * (y_coords[valid_mask] - yy_valid)) ** 2
                 )
                 
-                # Avoid division by zero
+                # ゼロ除算を回避
                 horiz_dist = np.maximum(horiz_dist, 1e-8)
                 
                 elevation_angle = np.arctan2(z_interp - z0[valid_mask], horiz_dist)
                 sun_angle = np.arcsin(sin_alt)
                 
-                # Update shadow mask for pixels that are now in shadow
+                # 現在影に入っているピクセルの影マスクを更新
                 shadow_pixels = chunk_indices[valid_mask][elevation_angle > sun_angle]
                 if len(shadow_pixels) > 0:
                     shadow_y = shadow_pixels // w
                     shadow_x = shadow_pixels % w
                     shadow_mask[shadow_y, shadow_x] = True
             
-            # Update progress
+            # 進捗更新
             processed_operations += 1
-            if processed_operations % 100 == 0:  # Update every 100 operations to avoid overhead
-                progress.advance(100, f"Shadow computation: chunk {chunk_idx + 1}/{total_chunks}, step {step_idx + 1}/{max_steps}")
+            if processed_operations % 100 == 0:  # オーバーヘッド回避のため100操作ごとに更新
+                progress.advance(100, f"影計算: チャンク {chunk_idx + 1}/{total_chunks}, ステップ {step_idx + 1}/{max_steps}")
     
-    # Advance any remaining progress
+    # 残りの進捗を進める
     remaining = total_chunks * max_steps - processed_operations
     if remaining > 0:
         progress.advance(remaining)
@@ -182,9 +231,9 @@ def _compute_shadow_mask_simple(
     progress: Optional[ProgressReporter] = None
 ) -> NDArray[np.bool_]:
     """
-    Simplified shadow computation for smaller DEMs or when memory is not a concern.
+    小さなDEMまたはメモリが問題でない場合の簡単な影計算
     
-    This version processes all pixels simultaneously for maximum vectorization.
+    このバージョンは最大ベクトル化のため全ピクセルを同時に処理します。
     """
     h, w = dem.shape
     shadow_mask = np.zeros((h, w), dtype=np.bool_)
@@ -192,36 +241,36 @@ def _compute_shadow_mask_simple(
     if progress is None:
         progress = NullProgress()
     
-    # Set up progress reporting
+    # 進捗レポート設定
     progress.set_range(max_steps)
     
-    # Create coordinate grids
+    # 座標グリッドを作成
     y_grid, x_grid = np.mgrid[0:h, 0:w]
     z0 = dem.copy()
     
     sun_angle = np.arcsin(sin_alt)
     
-    # Check each step
+    # 各ステップを確認
     for step in range(1, max_steps + 1):
-        # Calculate sample positions
+        # サンプル位置を計算
         xx = x_grid - cos_az * step
         yy = y_grid - sin_az * step
         
-        # Check bounds
+        # 境界チェック
         valid = (xx >= 0) & (yy >= 0) & (xx <= w - 1) & (yy <= h - 1)
         
         if not np.any(valid):
-            # Update progress for remaining steps
-            progress.advance(max_steps - step + 1, "Shadow computation completed early (no valid pixels)")
+            # 残りステップの進捗を更新
+            progress.advance(max_steps - step + 1, "影計算が早期完了（有効ピクセルなし）")
             break
             
-        # Bilinear interpolation
+        # バイリニア補間
         ix = np.clip(xx.astype(np.int32), 0, w - 2)
         iy = np.clip(yy.astype(np.int32), 0, h - 2)
         fx = np.clip(xx - ix, 0, 1)
         fy = np.clip(yy - iy, 0, 1)
         
-        # Ensure indices are valid
+        # インデックスが有効であることを確認
         ix = np.where(valid, ix, 0)
         iy = np.where(valid, iy, 0)
         
@@ -232,22 +281,22 @@ def _compute_shadow_mask_simple(
             dem[np.minimum(iy + 1, h - 1), np.minimum(ix + 1, w - 1)] * fx * fy
         )
         
-        # Calculate elevation angle
+        # 仰角を計算
         horiz_dist = np.sqrt((dx * (x_grid - xx)) ** 2 + (dy * (y_grid - yy)) ** 2)
-        horiz_dist = np.maximum(horiz_dist, 1e-8)  # Avoid division by zero
+        horiz_dist = np.maximum(horiz_dist, 1e-8)  # ゼロ除算回避
         
         elevation_angle = np.arctan2(z_interp - z0, horiz_dist)
         
-        # Update shadow mask
+        # 影マスクを更新
         shadow_mask |= valid & (elevation_angle > sun_angle)
         
-        # Update progress
-        progress.advance(1, f"Shadow computation: step {step}/{max_steps}")
+        # 進捗更新
+        progress.advance(1, f"影計算: ステップ {step}/{max_steps}")
     
     return shadow_mask
 
 # -----------------------------------------------------------------------------
-# Public functions
+# 公開関数
 # -----------------------------------------------------------------------------
 
 def direct_light(
@@ -259,52 +308,63 @@ def direct_light(
     cast_shadows: bool = True,
     max_shadow_radius: float = 500.0,
     memory_efficient: bool = True,
+    set_nan: Optional[float] = None,
+    replace_nan: Optional[float] = None,
     progress: Optional[ProgressReporter] = None
 ) -> NDArray[np.float32]:
-    """Lambertian hillshade with optional cast shadows (QGIS optimized).
+    """オプションの落影付きランベルト山岳陰影（QGIS最適化版）
 
     Parameters
     ----------
     dem : ndarray (H, W)
-        Elevation raster.
+        標高ラスタ
     azimuth_deg, altitude_deg : float
-        Solar position (0° = north, clockwise positive).
+        太陽位置（0° = 北、時計回り正）
     cellsize : float or (dy, dx)
-        Pixel size. Units must match *max_shadow_radius*.
+        ピクセルサイズ。単位は*max_shadow_radius*と一致する必要がある
     cast_shadows : bool
-        Whether to compute cast‐shadow mask.
+        落影マスクを計算するかどうか
     max_shadow_radius : float
-        Search distance for shadow casting.
+        影投射の探索距離
     memory_efficient : bool, default True
-        Use chunked processing for large DEMs. Set False for small DEMs
-        where full vectorization is preferred.
+        大容量DEMのチャンク処理を使用。小容量DEMで完全ベクトル化を
+        優先する場合はFalseに設定
+    set_nan : float, optional
+        この値をNaNに設定する
+    replace_nan : float, optional
+        NaN値をこの値で一時的に置換する（計算用）
     progress : ProgressReporter, optional
-        Progress reporting callback.
+        進捗レポートコールバック
 
     Returns
     -------
     shade : ndarray (H, W) in [0,1]
-        Hillshade values where 0=fully shadowed, 1=fully illuminated.
+        山岳陰影値。0=完全影、1=完全照明
     """
-    # Input validation
+    # 入力検証
     if dem.ndim != 2:
-        raise ValueError("DEM must be a 2D array")
+        raise ValueError("DEMは2次元配列である必要があります")
     if not (0 <= altitude_deg <= 90):
-        raise ValueError("Altitude must be in range [0, 90] degrees")
+        raise ValueError("高度は[0, 90]度の範囲である必要があります")
     
     if progress is None:
         progress = NullProgress()
     
-    # Set up main progress steps
-    total_steps = 3 if cast_shadows and max_shadow_radius > 0 else 2
+    # メイン進捗ステップを設定
+    total_steps = 4 if cast_shadows and max_shadow_radius > 0 else 3
     progress.set_range(total_steps)
     
-    progress.advance(0, "Computing surface normals...")
+    progress.advance(0, "NaN値処理中...")
     
-    # Handle cellsize parameter
+    # NaN値処理
+    dem_processed, original_nan_mask = _process_nan_values(dem, set_nan, replace_nan)
+    
+    progress.advance(1, "表面法線ベクトル計算中...")
+    
+    # cellsizeパラメータを処理
     dy, dx = (cellsize, cellsize) if np.isscalar(cellsize) else cellsize
     
-    # Convert angles to radians
+    # 角度をラジアンに変換
     az = math.radians(azimuth_deg)
     alt = math.radians(altitude_deg)
     sin_alt = math.sin(alt)
@@ -312,28 +372,28 @@ def direct_light(
     sin_az = math.sin(az)
     cos_az = math.cos(az)
 
-    # Ensure dem is float32 for consistency
-    dem_f32 = dem.astype(np.float32, copy=False)
+    # demがfloat32であることを確認（一貫性のため）
+    dem_f32 = dem_processed.astype(np.float32, copy=False)
     
-    # Compute surface normals
+    # 表面法線ベクトルを計算
     nx, ny, nz = _unit_normals(dem_f32, dy, dx)
-    progress.advance(1, "Computing illumination...")
+    progress.advance(1, "照明計算中...")
     
-    # Cosine of incidence angle (Lambert's law)
+    # 入射角の余弦（ランベルトの法則）
     cos_i = (nx * cos_az + ny * sin_az) * cos_alt + nz * sin_alt
     cos_i = np.clip(cos_i, 0.0, 1.0)
 
-    # Compute cast shadows if requested
+    # 要求された場合は落影を計算
     if cast_shadows and max_shadow_radius > 0:
-        progress.advance(0, "Computing cast shadows...")
+        progress.advance(0, "落影計算中...")
         
         max_steps = max(1, int(max_shadow_radius / max(dx, dy)))
         
-        # Choose shadow computation method based on DEM size and user preference
+        # DEMサイズとユーザー設定に基づいて影計算方法を選択
         total_pixels = dem.shape[0] * dem.shape[1]
         use_chunked = memory_efficient or total_pixels > 1_000_000
         
-        # Create sub-progress reporter for shadow computation
+        # 影計算用のサブ進捗レポーターを作成
         class SubProgress:
             def __init__(self, parent_progress: ProgressReporter):
                 self.parent = parent_progress
@@ -360,11 +420,14 @@ def direct_light(
                 dem_f32, max_steps, sin_az, cos_az, sin_alt, dy, dx, progress=sub_progress
             )
         
-        # Apply shadows
+        # 影を適用
         cos_i[shadow_mask] = 0.0
-        progress.advance(1, "Shadows applied")
+        progress.advance(1, "影適用完了")
     
-    progress.advance(1, "Finalizing direct light computation...")
+    # 元のNaN位置を復元
+    cos_i[original_nan_mask] = np.nan
+    
+    progress.advance(1, "直射光計算完了...")
     
     return cos_i.astype(np.float32, copy=False)
 
@@ -376,48 +439,59 @@ def sky_light(
     max_radius: float = 100.0,
     n_directions: int = 16,
     weight_cos2: bool = True,
+    set_nan: Optional[float] = None,
+    replace_nan: Optional[float] = None,
     progress: Optional[ProgressReporter] = None
 ) -> NDArray[np.float32]:
-    """Isotropic skylight integral (0–1) - QGIS optimized.
+    """等方性天空光積分（0–1）- QGIS最適化版
 
     Parameters
     ----------
     dem : ndarray (H,W)
-        Elevation raster.
+        標高ラスタ
     cellsize : float or (dy,dx)
-        Pixel size.
+        ピクセルサイズ
     max_radius : float
-        Horizon scan distance.
+        水平線スキャン距離
     n_directions : int
-        Number of azimuth sectors.
+        方位角セクター数
     weight_cos2 : bool, default True
-        Weight each direction by ``cos^2(theta)`` (Oke‐style). If False uses
-        simple SVF average.
+        各方向を``cos^2(theta)``で重み付け（Okeスタイル）。Falseの場合は
+        単純なSVF平均を使用
+    set_nan : float, optional
+        この値をNaNに設定する
+    replace_nan : float, optional
+        NaN値をこの値で一時的に置換する（計算用）
     progress : ProgressReporter, optional
-        Progress reporting callback.
+        進捗レポートコールバック
 
     Returns
     -------
     sky : ndarray (H, W) in [0,1]
-        Sky view factor where 0=completely obstructed, 1=full sky visibility.
+        天空率。0=完全遮蔽、1=完全天空可視
     """
     if progress is None:
         progress = NullProgress()
     
-    # Set up progress tracking
-    progress.set_range(3)
-    progress.advance(0, "Computing sky view factor...")
+    # 進捗追跡を設定
+    progress.set_range(4)
+    progress.advance(0, "NaN値処理中...")
     
-    # Local import to avoid circular dependencies
+    # NaN値処理
+    dem_processed, original_nan_mask = _process_nan_values(dem, set_nan, replace_nan)
+    
+    progress.advance(1, "天空率計算中...")
+
+    # 循環依存回避のためローカルインポート
     from FujiShader.shader.skyview import skyview_factor as _svf
 
-    # Create sub-progress reporter for SVF computation
+    # SVF計算用のサブ進捗レポーターを作成
     class SubProgress:
         def __init__(self, parent_progress: ProgressReporter):
             self.parent = parent_progress
         
         def set_range(self, maximum: int) -> None:
-            pass  # Parent handles main progress
+            pass  # 親が主進捗を処理
         
         def advance(self, step: int = 1, text: Optional[str] = None) -> None:
             if text:
@@ -427,63 +501,66 @@ def sky_light(
             pass
     
     sub_progress = SubProgress(progress)
-    svf = _svf(dem, cellsize=cellsize, max_radius=max_radius, 
+    svf = _svf(dem_processed, cellsize=cellsize, max_radius=max_radius, 
                n_directions=n_directions, progress=sub_progress)
     
-    progress.advance(1, "Applying weighting...")
+    progress.advance(1, "重み付け適用中...")
     
     if weight_cos2:
-        # Convert SVF to cosine-squared weighted sky illumination
-        # SVF represents 1 - mean(cos^2(θ)), so we need 1 - SVF
+        # SVFをコサイン二乗重み付け天空照明に変換
+        # SVFは1 - mean(cos^2(θ))を表すので、1 - SVFが必要
         cos2_mean = 1.0 - svf
         sky = cos2_mean
     else:
-        # Use raw SVF
+        # 生のSVFを使用
         sky = svf
     
-    progress.advance(1, "Finalizing sky light...")
+    # 元のNaN位置を復元
+    sky[original_nan_mask] = np.nan
+    
+    progress.advance(1, "天空光計算完了...")
     
     result = np.clip(sky, 0.0, 1.0).astype(np.float32, copy=False)
-    progress.advance(1, "Sky light computation complete")
+    progress.advance(1, "天空光計算完了")
     
     return result
 
 
 # -----------------------------------------------------------------------------
-# Utility functions for QGIS integration
+# QGIS統合用ユーティリティ関数
 # -----------------------------------------------------------------------------
 
 def estimate_memory_usage(dem_shape: Tuple[int, int], max_shadow_radius: float, 
                          cellsize: float) -> dict:
     """
-    Estimate memory usage for shadow computation to help users choose appropriate settings.
+    影計算のメモリ使用量を推定してユーザーが適切な設定を選択できるよう支援
     
     Parameters
     ----------
     dem_shape : tuple of int
-        Shape of the DEM (height, width).
+        DEMの形状（高さ、幅）
     max_shadow_radius : float
-        Maximum shadow search radius.
+        最大影探索半径
     cellsize : float
-        Cell size of the DEM.
+        DEMのセルサイズ
     
     Returns
     -------
     dict
-        Dictionary with memory estimates in MB.
+        メモリ推定値（MB単位）を含む辞書
     """
     h, w = dem_shape
     total_pixels = h * w
     max_steps = max(1, int(max_shadow_radius / cellsize))
     
-    # Estimate memory for different approaches
-    base_memory = total_pixels * 4 / 1024 / 1024  # DEM in float32
-    shadow_mask_memory = total_pixels / 1024 / 1024 / 8  # boolean mask
+    # 異なるアプローチのメモリを推定
+    base_memory = total_pixels * 4 / 1024 / 1024  # float32のDEM
+    shadow_mask_memory = total_pixels / 1024 / 1024 / 8  # booleanマスク
     
-    # Simple vectorized approach
-    simple_temp_memory = total_pixels * 8 * 4 / 1024 / 1024  # coordinate grids in float64
+    # 単純ベクトル化アプローチ
+    simple_temp_memory = total_pixels * 8 * 4 / 1024 / 1024  # float64の座標グリッド
     
-    # Chunked approach (assuming 1000 pixel chunks)
+    # チャンクアプローチ（1000ピクセルチャンクを想定）
     chunk_memory = min(1000, total_pixels) * 8 * 4 / 1024 / 1024
     
     return {
@@ -498,34 +575,34 @@ def estimate_memory_usage(dem_shape: Tuple[int, int], max_shadow_radius: float,
 
 def get_optimal_chunk_size(available_memory_mb: float, dem_shape: Tuple[int, int]) -> int:
     """
-    Calculate optimal chunk size based on available memory.
+    利用可能メモリに基づいて最適なチャンクサイズを計算
     
     Parameters
     ----------
     available_memory_mb : float
-        Available memory in megabytes.
+        利用可能メモリ（メガバイト）
     dem_shape : tuple of int
-        Shape of the DEM.
+        DEMの形状
     
     Returns
     -------
     int
-        Optimal chunk size in pixels.
+        最適なチャンクサイズ（ピクセル単位）
     """
-    # Estimate memory per pixel for processing (roughly 32 bytes per pixel)
+    # 処理あたりのピクセルメモリを推定（ピクセルあたり約32バイト）
     memory_per_pixel = 32
     max_pixels = int(available_memory_mb * 1024 * 1024 / memory_per_pixel)
     
-    # Ensure we don't exceed total pixels
+    # 総ピクセル数を超えないよう確認
     total_pixels = dem_shape[0] * dem_shape[1]
     chunk_size = min(max_pixels, total_pixels)
     
-    # Ensure minimum chunk size for efficiency
+    # 効率のため最小チャンクサイズを確保
     return max(100, chunk_size)
 
 
 # -----------------------------------------------------------------------------
-# Convenience functions for batch processing
+# バッチ処理用便利関数
 # -----------------------------------------------------------------------------
 
 def compute_sun_sky_composite(
@@ -541,94 +618,102 @@ def compute_sun_sky_composite(
     sun_weight: float = 0.7,
     sky_weight: float = 0.3,
     memory_efficient: bool = True,
+    set_nan: Optional[float] = None,
+    replace_nan: Optional[float] = None,
     progress: Optional[ProgressReporter] = None
 ) -> NDArray[np.float32]:
     """
-    Compute a weighted composite of direct sunlight and sky illumination.
+    直射日光と天空照明の重み付け合成を計算
     
-    This is a convenience function that combines direct_light and sky_light
-    with proper progress reporting for the entire operation.
+    これは操作全体の適切な進捗レポートと共にdirect_lightとsky_lightを
+    組み合わせる便利関数です。
     
     Parameters
     ----------
     dem : ndarray (H, W)
-        Elevation raster.
+        標高ラスタ
     azimuth_deg, altitude_deg : float
-        Solar position parameters.
+        太陽位置パラメータ
     cellsize : float or (dy, dx)
-        Pixel size.
+        ピクセルサイズ
     cast_shadows : bool
-        Whether to compute cast shadows for direct light.
+        直射光の落影を計算するかどうか
     max_shadow_radius : float
-        Shadow search radius for direct light.
+        直射光の影探索半径
     max_sky_radius : float
-        Sky view radius.
+        天空率半径
     n_directions : int
-        Number of azimuth directions for sky computation.
+        天空計算の方位角方向数
     sun_weight, sky_weight : float
-        Weights for combining direct and sky illumination.
+        直射光と天空照明の組み合わせ重み
     memory_efficient : bool
-        Use memory-efficient processing.
+        メモリ効率処理を使用
+    set_nan : float, optional
+        この値をNaNに設定する
+    replace_nan : float, optional
+        NaN値をこの値で一時的に置換する（計算用）
     progress : ProgressReporter, optional
-        Progress reporting callback.
+        進捗レポートコールバック
     
     Returns
     -------
     composite : ndarray (H, W) in [0,1]
-        Weighted composite illumination.
+        重み付け合成照明
     """
     if progress is None:
         progress = NullProgress()
     
     progress.set_range(3)
     
-    # Compute direct light
-    progress.advance(0, "Computing direct sunlight...")
+    # 直射光を計算
+    progress.advance(0, "直射日光計算中...")
     
     class DirectLightProgress:
         def __init__(self, parent: ProgressReporter):
             self.parent = parent
         def set_range(self, maximum: int) -> None: pass
         def advance(self, step: int = 1, text: Optional[str] = None) -> None:
-            if text: self.parent.advance(0, f"Direct: {text}")
+            if text: self.parent.advance(0, f"直射光: {text}")
         def done(self) -> None: pass
     
     direct = direct_light(
         dem, azimuth_deg=azimuth_deg, altitude_deg=altitude_deg,
         cellsize=cellsize, cast_shadows=cast_shadows,
         max_shadow_radius=max_shadow_radius, memory_efficient=memory_efficient,
+        set_nan=set_nan, replace_nan=replace_nan,
         progress=DirectLightProgress(progress)
     )
     
-    progress.advance(1, "Computing sky illumination...")
+    progress.advance(1, "天空照明計算中...")
     
-    # Compute sky light
+    # 天空光を計算
     class SkyLightProgress:
         def __init__(self, parent: ProgressReporter):
             self.parent = parent
         def set_range(self, maximum: int) -> None: pass
         def advance(self, step: int = 1, text: Optional[str] = None) -> None:
-            if text: self.parent.advance(0, f"Sky: {text}")
+            if text: self.parent.advance(0, f"天空光: {text}")
         def done(self) -> None: pass
     
     sky = sky_light(
         dem, cellsize=cellsize, max_radius=max_sky_radius,
-        n_directions=n_directions, progress=SkyLightProgress(progress)
+        n_directions=n_directions, set_nan=set_nan, replace_nan=replace_nan,
+        progress=SkyLightProgress(progress)
     )
     
-    progress.advance(1, "Combining illumination...")
+    progress.advance(1, "照明合成中...")
     
-    # Normalize weights
+    # 重みを正規化
     total_weight = sun_weight + sky_weight
     if total_weight <= 0:
-        raise ValueError("Total weight must be positive")
+        raise ValueError("総重みは正の値である必要があります")
     
     sun_weight_norm = sun_weight / total_weight
     sky_weight_norm = sky_weight / total_weight
     
-    # Combine
+    # 合成
     composite = sun_weight_norm * direct + sky_weight_norm * sky
     
-    progress.advance(1, "Composite illumination complete")
+    progress.advance(1, "合成照明完了")
     
     return np.clip(composite, 0.0, 1.0).astype(np.float32, copy=False)

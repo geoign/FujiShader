@@ -2,35 +2,31 @@
 FujiShader.shader.skyview
 =========================
 
-Sky‑View Factor (SVF) computation in pure Python/NumPy optimized for QGIS
-environments. SVF expresses how much of the upper hemisphere is visible
-from each DEM cell (0 = fully enclosed, 1 = unobstructed sky) and is widely
-used as an azimuth‑independent proxy for ambient occlusion, cold‑air drainage
-analysis, or 'warm–cool' colour mapping.
+Sky‑View Factor (SVF) 計算 - 純粋Python/NumPy実装でQGIS環境に最適化
+SVF は各DEMセルから見える上半球の割合を表現します (0 = 完全に囲まれている, 1 = 完全な天空)
+方位角に依存しない ambient occlusion の代替手法、冷気滞留解析、暖寒色マッピングなどに広く使用されます。
 
-The classic definition is
+古典的な定義は以下の通りです：
 
     SVF = 1⁄n Σ cos² θᵢ            (Oke 1988)
 
-where *θᵢ* is the elevation angle to the terrain horizon in direction *i*.
-We approximate the integral with an evenly spaced set of azimuths (default
-16).  Horizon angles are found by radial scanning out to a user‑defined
-``max_radius`` (px or metres).
+ここで *θᵢ* は方向 *i* における地平線への仰角です。
+均等に配置された方位角セット（デフォルト16方向）で積分を近似します。
+地平線角度は、ユーザー定義の ``max_radius`` （ピクセルまたはメートル）まで
+放射状にスキャンして求めます。
 
-Key features
-------------
-* **Pure NumPy** – optimized for QGIS Python environments without external
-  JIT compilers.
-* **Vectorized operations** – efficient batch processing using NumPy's
-  broadcasting and advanced indexing.
-* **Metric‑aware** – accept pixel size in metres so the scan distance remains
-  physically meaningful after reprojection.
-* **Tiled processing** – no DEM is too large; tiles are merged seamlessly.
+主な特徴
+--------
+* **純粋NumPy** – 外部JITコンパイラなしでQGIS Python環境に最適化
+* **ベクトル化演算** – NumPyのブロードキャストと高度なインデクシングによる効率的バッチ処理
+* **メートル単位対応** – 再投影後も物理的に意味のあるスキャン距離を維持
+* **タイル処理** – どんなに大きなDEMでもシームレスにタイル結合して処理
+* **NaN値完全対応** – メタデータとマニュアル指定のNaN値を適切に処理
 """
 from __future__ import annotations
 
 from ..core.progress import ProgressReporter, NullProgress
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import math
 
@@ -40,7 +36,54 @@ from numpy.typing import NDArray
 __all__ = ["skyview_factor"]
 
 # -----------------------------------------------------------------------------
-# _horizon_scan: NumPy vectorized core
+# NaN値処理ユーティリティ
+# -----------------------------------------------------------------------------
+
+def _prepare_dem_with_nan_handling(
+    dem: NDArray[np.float32],
+    set_nan: Optional[float] = None,
+    replace_nan: Optional[float] = None,
+) -> Tuple[NDArray[np.float32], NDArray[np.bool_]]:
+    """
+    DEMのNaN値処理を行い、処理用の配列とマスクを返す
+    
+    Parameters
+    ----------
+    dem : ndarray
+        入力DEM
+    set_nan : float, optional
+        この値をNaNに設定
+    replace_nan : float, optional
+        NaN値をこの値で置換
+        
+    Returns
+    -------
+    processed_dem : ndarray
+        処理済みDEM
+    original_nan_mask : ndarray
+        元のNaN位置のマスク（結果にNaNを復元するため）
+    """
+    processed_dem = dem.copy().astype(np.float32)
+    
+    # 元のNaN位置を記録
+    original_nan_mask = np.isnan(processed_dem)
+    
+    # 指定値をNaNに設定
+    if set_nan is not None:
+        set_mask = np.isclose(processed_dem, set_nan, equal_nan=False)
+        processed_dem[set_mask] = np.nan
+        original_nan_mask |= set_mask
+    
+    # NaN値を指定値で置換（計算用）
+    if replace_nan is not None:
+        nan_mask = np.isnan(processed_dem)
+        processed_dem[nan_mask] = replace_nan
+    
+    return processed_dem, original_nan_mask
+
+
+# -----------------------------------------------------------------------------
+# _horizon_scan: NumPy ベクトル化コア
 # -----------------------------------------------------------------------------
 
 def _horizon_scan_vectorized(
@@ -53,7 +96,7 @@ def _horizon_scan_vectorized(
     progress: ProgressReporter | None = None,
     progress_prefix: str = "",
 ) -> NDArray[np.float32]:
-    """Return SVF for a tile using vectorized horizon scanning."""
+    """ベクトル化された地平線スキャンを使用してタイルのSVFを返す"""
     h, w = dem.shape
     n_dir = sin_az.size
     
@@ -96,11 +139,22 @@ def _horizon_scan_vectorized(
             z = np.zeros((h, w), dtype=np.float32)
             mask = valid_mask
             
-            z[mask] = (
-                dem[iy[mask], ix[mask]] * (1 - fx[mask]) * (1 - fy[mask]) +
-                dem[iy[mask], ix[mask] + 1] * fx[mask] * (1 - fy[mask]) +
-                dem[iy[mask] + 1, ix[mask]] * (1 - fx[mask]) * fy[mask] +
-                dem[iy[mask] + 1, ix[mask] + 1] * fx[mask] * fy[mask]
+            # NaN値のチェックを追加した双線形補間
+            z_00 = dem[iy[mask], ix[mask]]
+            z_01 = dem[iy[mask], ix[mask] + 1]
+            z_10 = dem[iy[mask] + 1, ix[mask]]
+            z_11 = dem[iy[mask] + 1, ix[mask] + 1]
+            
+            # いずれかがNaNの場合は補間結果もNaN
+            interp_valid = ~(np.isnan(z_00) | np.isnan(z_01) | np.isnan(z_10) | np.isnan(z_11))
+            
+            z[mask] = np.where(
+                interp_valid,
+                (z_00 * (1 - fx[mask]) * (1 - fy[mask]) +
+                 z_01 * fx[mask] * (1 - fy[mask]) +
+                 z_10 * (1 - fx[mask]) * fy[mask] +
+                 z_11 * fx[mask] * fy[mask]),
+                np.nan
             )
             
             # 距離と角度計算
@@ -109,16 +163,22 @@ def _horizon_scan_vectorized(
             dist_y = dy * (yy - y_idx)
             dist = np.sqrt(dist_x * dist_x + dist_y * dist_y)
             
-            # ゼロ除算対策
+            # ゼロ除算対策とNaN処理
             dist = np.where(dist > 1e-10, dist, 1e-10)
             angles = np.arctan2(dz, dist)
             
+            # NaN値を含む計算では適切にNaNを伝播
+            angles = np.where(np.isnan(dz), -1e9, angles)
+            
             # 最大角度更新（有効な点のみ）
-            update_mask = mask & (angles > max_angles)
+            update_mask = mask & (angles > max_angles) & ~np.isnan(angles)
             max_angles[update_mask] = angles[update_mask]
         
         # この方向のSVF寄与を加算
-        svf_sum += np.cos(max_angles) ** 2
+        # NaNが含まれる場合は適切に処理
+        direction_contribution = np.cos(max_angles) ** 2
+        direction_contribution = np.where(np.isfinite(direction_contribution), direction_contribution, 0.0)
+        svf_sum += direction_contribution
         
         # 進捗更新
         if progress:
@@ -140,7 +200,7 @@ def _horizon_scan_chunked(
     progress: ProgressReporter | None = None,
     progress_prefix: str = "",
 ) -> NDArray[np.float32]:
-    """Memory-efficient version processing pixels in chunks."""
+    """メモリ効率版：ピクセルをチャンクで処理"""
     h, w = dem.shape
     n_dir = sin_az.size
     result = np.zeros((h, w), dtype=np.float32)
@@ -185,17 +245,28 @@ def _horizon_scan_chunked(
                 if not valid_mask.any():
                     break
                 
-                # 双線形補間
+                # 双線形補間（NaN対応）
                 ix = xx[valid_mask].astype(np.int32)
                 iy = yy[valid_mask].astype(np.int32)
                 fx = xx[valid_mask] - ix
                 fy = yy[valid_mask] - iy
                 
-                z_interp = (
-                    dem[iy, ix] * (1 - fx) * (1 - fy) +
-                    dem[iy, ix + 1] * fx * (1 - fy) +
-                    dem[iy + 1, ix] * (1 - fx) * fy +
-                    dem[iy + 1, ix + 1] * fx * fy
+                # 補間に使用する4点の値を取得
+                z_00 = dem[iy, ix]
+                z_01 = dem[iy, ix + 1]
+                z_10 = dem[iy + 1, ix]
+                z_11 = dem[iy + 1, ix + 1]
+                
+                # いずれかがNaNの場合は補間結果もNaN
+                interp_valid = ~(np.isnan(z_00) | np.isnan(z_01) | np.isnan(z_10) | np.isnan(z_11))
+                
+                z_interp = np.where(
+                    interp_valid,
+                    (z_00 * (1 - fx) * (1 - fy) +
+                     z_01 * fx * (1 - fy) +
+                     z_10 * (1 - fx) * fy +
+                     z_11 * fx * fy),
+                    np.nan
                 )
                 
                 # 角度計算
@@ -209,12 +280,18 @@ def _horizon_scan_chunked(
                 
                 angles = np.arctan2(dz, dist)
                 
+                # NaN値の処理
+                angles = np.where(np.isnan(dz), -1e9, angles)
+                
                 # 最大角度更新
                 update_indices = np.where(valid_mask)[0]
-                angle_update_mask = angles > max_angles[update_indices]
+                angle_update_mask = (angles > max_angles[update_indices]) & np.isfinite(angles)
                 max_angles[update_indices[angle_update_mask]] = angles[angle_update_mask]
             
-            svf_chunk += np.cos(max_angles) ** 2
+            # この方向のSVF寄与を計算
+            direction_contribution = np.cos(max_angles) ** 2
+            direction_contribution = np.where(np.isfinite(direction_contribution), direction_contribution, 0.0)
+            svf_chunk += direction_contribution
             work_done += 1
             
             # 進捗更新
@@ -231,7 +308,7 @@ def _horizon_scan_chunked(
 
 
 # -----------------------------------------------------------------------------
-# Public function
+# 公開関数
 # -----------------------------------------------------------------------------
 
 def skyview_factor(
@@ -242,55 +319,62 @@ def skyview_factor(
     n_directions: int = 16,
     tile_size: int | None = None,
     memory_efficient: bool = False,
+    set_nan: Optional[float] = None,
+    replace_nan: Optional[float] = None,
     progress: ProgressReporter | None = None,
 ) -> NDArray[np.float32]:
-    """Compute sky‑view factor from a DEM.
+    """DEM から Sky‑View Factor を計算します。
 
     Parameters
     ----------
     dem : ndarray (H, W)
-        Elevation raster (float32 preferred).
+        標高ラスタ（float32推奨）
     cellsize : float or (float, float), default 1.0
-        Pixel size in map units (e.g. metres).  If tuple, interpreted as
-        ``(dy, dx)``.
+        ピクセルサイズ（マップ単位、例：メートル）。タプルの場合は ``(dy, dx)`` として解釈
     max_radius : float, default 100.0
-        Scan distance in the same units as *cellsize*.
+        *cellsize* と同じ単位でのスキャン距離
     n_directions : int, default 16
-        Number of azimuth sectors (uniformly spaced from 0–360°).
+        方位角セクター数（0–360°で均等配置）
     tile_size : int or None, default None
-        Process DEM in ``tile_size × tile_size`` blocks to conserve RAM.
-        ``None`` means whole DEM at once.
+        RAM節約のために DEM を ``tile_size × tile_size`` ブロックで処理
+        ``None`` の場合は DEM 全体を一度に処理
     memory_efficient : bool, default False
-        Use chunk-based processing to reduce memory usage at the cost of
-        some performance. Recommended for very large DEMs or limited RAM.
+        非常に大きなDEMや限られたRAMに対して、パフォーマンスを犠牲にして
+        メモリ使用量を削減するチャンクベース処理を使用
+    set_nan : float, optional
+        この値をNaNに設定（処理開始時）
+    replace_nan : float, optional
+        NaN値をこの値で置換（計算用、結果では元のNaN位置を復元）
     progress : ProgressReporter or None, default None
-        Progress reporter for long-running operations.
+        長時間実行される操作の進捗レポーター
 
     Returns
     -------
     svf : ndarray (H, W)
-        Sky‑view factor in [0, 1].  NaN pixels in input are preserved.
+        Sky‑View Factor [0, 1]範囲。入力のNaNピクセルは保持されます
     """
 
     if dem.ndim != 2:
-        raise ValueError("DEM must be 2‑D array")
+        raise ValueError("DEM は 2次元配列である必要があります")
     
     progress = progress or NullProgress()
 
-    dem = dem.astype(np.float32, copy=False)
+    # NaN値処理
+    processed_dem, original_nan_mask = _prepare_dem_with_nan_handling(dem, set_nan, replace_nan)
+    
     dy, dx = (cellsize, cellsize) if np.isscalar(cellsize) else cellsize
 
-    # Step count in pixels
+    # ピクセル単位でのステップ数
     max_dist_px = int(max_radius / max(dx, dy))
     if max_dist_px < 1:
-        raise ValueError("max_radius too small relative to cellsize")
+        raise ValueError("max_radius が cellsize に対して小さすぎます")
 
     # 大きなスキャン距離に対する警告
-    if max_dist_px > min(dem.shape) // 2:
+    if max_dist_px > min(processed_dem.shape) // 2:
         import warnings
         warnings.warn(
-            f"max_radius ({max_radius}) may be too large for DEM size "
-            f"{dem.shape}. Consider reducing max_radius or using tiled processing.",
+            f"max_radius ({max_radius}) が DEM サイズ {processed_dem.shape} に対して大きすぎる可能性があります。"
+            f"max_radius を減らすか、タイル処理の使用を検討してください。",
             RuntimeWarning
         )
 
@@ -298,24 +382,22 @@ def skyview_factor(
     sin_az = np.sin(az)
     cos_az = np.cos(az)
 
-    nan_mask = np.isnan(dem)
-
     # スキャン関数の選択
     scan_func = _horizon_scan_chunked if memory_efficient else _horizon_scan_vectorized
 
     if tile_size is None:
         # 単一タイル（＝DEM 全体）として扱う
-        h, w = dem.shape
+        h, w = processed_dem.shape
         progress.set_range(1)  # 初期化
         progress.advance(text=f"SVF計算開始 - DEM: {h}×{w}, 方向数: {n_directions}, 最大距離: {max_radius}")
         
-        svf = scan_func(dem, max_dist_px, dx, dy, sin_az, cos_az, progress=progress)
+        svf = scan_func(processed_dem, max_dist_px, dx, dy, sin_az, cos_az, progress=progress)
         
         progress.set_range(1)  # 完了用にリセット
         progress.advance(text="SVF計算完了")
     else:
-        h, w = dem.shape
-        svf = np.empty_like(dem)
+        h, w = processed_dem.shape
+        svf = np.empty_like(processed_dem)
         n_tiles_y = math.ceil(h / tile_size)
         n_tiles_x = math.ceil(w / tile_size)
         total_tiles = n_tiles_y * n_tiles_x
@@ -332,7 +414,7 @@ def skyview_factor(
                 y1 = min(y0 + tile_size, h)
                 x1 = min(x0 + tile_size, w)
                 
-                tile = dem[y0:y1, x0:x1]
+                tile = processed_dem[y0:y1, x0:x1]
                 tile_h, tile_w = tile.shape
                 
                 # 各タイル用の子プログレス（実際の詳細進捗は内部関数で管理）
@@ -355,7 +437,9 @@ def skyview_factor(
 
     # 結果の後処理
     svf = np.clip(svf, 0.0, 1.0)
-    if nan_mask.any():
-        svf[nan_mask] = np.nan
+    
+    # 元のNaN位置を復元
+    if original_nan_mask.any():
+        svf[original_nan_mask] = np.nan
     
     return svf

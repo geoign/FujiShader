@@ -2,14 +2,14 @@
 FujiShader.shader.swissshade
 ===========================
 
-Swiss‐style multi‐directional hillshade (diffuse soft shading)
---------------------------------------------------------------
-Combines 3 or more low-intensity hillshades from different azimuths and a
-moderate altitude to achieve a soft, directionally neutral relief—popularised
-by Eduard Imhof.
+スイス風多方向ヒルシェード（拡散ソフトシェーディング）
+----------------------------------------------------
+3つ以上の異なる方位角からの低強度ヒルシェードを組み合わせ、
+適度な高度角で、柔らかく方向性のない陰影を実現します。
+Eduard Imhofによって普及されました。
 
-This implementation provides a robust, memory-efficient approach suitable for
-large DEMs in QGIS environments.
+この実装は、QGISの環境で大容量DEMに適した、
+堅牢でメモリ効率的なアプローチを提供します。
 """
 from __future__ import annotations
 
@@ -18,10 +18,97 @@ import warnings
 import numpy as np
 from numpy.typing import NDArray
 
-from FujiShader.shader.sunsky import direct_light
 from ..core.progress import ProgressReporter, NullProgress
 
-__all__ = ["swiss_shade", "estimate_swiss_memory"]
+__all__ = ["swiss_shade", "estimate_swiss_memory", "swiss_shade_classic"]
+
+
+def _compute_hillshade(
+    dem: NDArray[np.float32],
+    azimuth_deg: float,
+    altitude_deg: float,
+    cellsize: Union[float, Tuple[float, float]] = 1.0,
+    memory_efficient: bool = True
+) -> NDArray[np.float32]:
+    """
+    基本的なヒルシェードを計算する
+    
+    Parameters
+    ----------
+    dem : ndarray (H, W)
+        標高モデル
+    azimuth_deg : float
+        方位角（度、0°=北、時計回り）
+    altitude_deg : float
+        太陽高度角（度）
+    cellsize : float or tuple
+        セルサイズ
+    memory_efficient : bool
+        メモリ効率モード（現在は使用せず）
+        
+    Returns
+    -------
+    hillshade : ndarray (H, W)
+        ヒルシェード値 [0, 1]
+    """
+    # セルサイズの処理
+    if isinstance(cellsize, (tuple, list)):
+        dx, dy = cellsize[1], cellsize[0]  # (row_spacing, col_spacing)
+    else:
+        dx = dy = cellsize
+    
+    # 角度をラジアンに変換
+    azimuth_rad = np.radians(azimuth_deg)
+    altitude_rad = np.radians(altitude_deg)
+    
+    # 太陽光の方向ベクトル
+    light_x = np.sin(azimuth_rad) * np.cos(altitude_rad)
+    light_y = -np.cos(azimuth_rad) * np.cos(altitude_rad)  # 北が-y方向
+    light_z = np.sin(altitude_rad)
+    
+    # 勾配計算（Sobelフィルタ使用）
+    # NaN値の処理を考慮
+    dem_padded = np.pad(dem, ((1, 1), (1, 1)), mode='edge')
+    
+    # x方向勾配（東西方向）
+    grad_x = (
+        dem_padded[1:-1, 2:] - dem_padded[1:-1, :-2]
+    ) / (2.0 * dx)
+    
+    # y方向勾配（南北方向）
+    grad_y = (
+        dem_padded[:-2, 1:-1] - dem_padded[2:, 1:-1]
+    ) / (2.0 * dy)
+    
+    # 表面法線ベクトル
+    # n = (-dz/dx, -dz/dy, 1)を正規化
+    normal_x = -grad_x
+    normal_y = -grad_y
+    normal_z = np.ones_like(grad_x)
+    
+    # 正規化
+    norm = np.sqrt(normal_x**2 + normal_y**2 + normal_z**2)
+    # NaNや0による除算を避ける
+    norm = np.where(norm > 0, norm, 1.0)
+    normal_x /= norm
+    normal_y /= norm
+    normal_z /= norm
+    
+    # ランベルト反射モデル（内積）
+    hillshade = (
+        normal_x * light_x +
+        normal_y * light_y + 
+        normal_z * light_z
+    )
+    
+    # [0, 1]範囲にクランプ
+    hillshade = np.clip(hillshade, 0.0, 1.0)
+    
+    # 元のNaN位置を復元
+    original_nan_mask = np.isnan(dem)
+    hillshade[original_nan_mask] = np.nan
+    
+    return hillshade.astype(np.float32)
 
 
 def swiss_shade(
@@ -31,156 +118,168 @@ def swiss_shade(
     altitude_deg: float = 45.0,
     cellsize: Union[float, Tuple[float, float]] = 1.0,
     weight: float = 1.0,
-    cast_shadows: bool = False,
-    max_shadow_radius: float = 100.0,
     memory_efficient: bool = True,
     normalize_by_count: bool = True,
+    set_nan: float = None,
+    replace_nan: float = None,
     progress: ProgressReporter = None
 ) -> NDArray[np.float32]:
-    """Return composite Swiss hillshade in [0,1].
+    """
+    スイス風合成ヒルシェードを[0,1]範囲で返す
     
     Parameters
     ----------
     dem : ndarray (H, W)
-        Digital elevation model as 2D array.
+        2D配列としてのデジタル標高モデル
     azimuths_deg : iterable of float, default (225, 315, 45, 135)
-        Azimuth angles in degrees (0° = north, clockwise positive).
-        Must contain at least one azimuth.
+        方位角（度）のリスト（0° = 北、時計回り正）
+        少なくとも1つの方位角が必要
     altitude_deg : float, default 45.0
-        Solar altitude angle in degrees [0, 90].
+        太陽高度角（度）[0, 90]
     cellsize : float or (dy, dx), default 1.0
-        Pixel size. If tuple, (row_spacing, col_spacing).
+        ピクセルサイズ。タプルの場合は(行間隔, 列間隔)
     weight : float, default 1.0
-        Global weight factor applied to final result.
-    cast_shadows : bool, default False
-        Whether to compute cast shadows. Generally disabled for Swiss shading
-        to maintain soft, even illumination.
-    max_shadow_radius : float, default 100.0
-        Maximum search distance for shadow casting (if enabled).
+        最終結果に適用される全体重みファクター
     memory_efficient : bool, default True
-        Use chunked processing for large DEMs.
+        大容量DEM用のチャンク処理を使用
     normalize_by_count : bool, default True
-        Normalize result by number of directions to maintain [0,1] range
-        regardless of azimuth count.
+        方位数で結果を正規化して方位数に関係なく[0,1]範囲を維持
+    set_nan : float, optional
+        この値をNaNに設定（処理開始時）
+    replace_nan : float, optional
+        NaN値をこの値で置換（計算用）
     progress : ProgressReporter, optional
-        Progress reporting callback.
+        進捗レポートコールバック
         
     Returns
     -------
     shade : ndarray (H, W) in [0,1]
-        Composite Swiss hillshade where 0=dark, 1=bright.
+        合成スイスヒルシェード（0=暗、1=明）
         
     Raises
     ------
     ValueError
-        If DEM is not 2D, no azimuths provided, or altitude out of range.
+        DEMが2Dでない、方位角が提供されていない、または高度角が範囲外の場合
     TypeError
-        If DEM is not numeric array.
+        DEMが数値配列でない場合
         
     Notes
     -----
-    Swiss shading typically uses 3-4 cardinal/intercardinal directions
-    (N, NE, E, SE or NW, NE, SE, SW) at moderate altitude (30-60°).
-    Cast shadows are usually disabled to preserve the soft, even lighting
-    characteristic of this technique.
+    スイスシェーディングは通常、適度な高度角（30-60°）で
+    3-4の基本/中間方向（N, NE, E, SE または NW, NE, SE, SW）を使用します。
+    この技法の特徴である柔らかく均等な照明を保持するため、
+    投影影は通常無効にされます。
     
     Examples
     --------
     >>> dem = np.random.rand(100, 100).astype(np.float32)
-    >>> # Basic Swiss shading with 4 directions
+    >>> # 4方向での基本スイスシェーディング
     >>> shade = swiss_shade(dem)
-    >>> # Custom directions with shadows
-    >>> shade = swiss_shade(dem, azimuths_deg=[0, 90, 180, 270], 
-    ...                    cast_shadows=True)
+    >>> # カスタム方向
+    >>> shade = swiss_shade(dem, azimuths_deg=[0, 90, 180, 270])
     """
-    # Initialize progress reporter
+    # 進捗レポーターの初期化
     if progress is None:
         progress = NullProgress()
         
-    # Setup progress tracking
-    # 処理ステップ: 検証(1) + 各方位での計算(n) + 合成(1) + 最終化(1)
+    # 進捗追跡の設定
     azimuth_list = list(azimuths_deg)
     if not azimuth_list:
-        raise ValueError("At least one azimuth must be provided")
+        raise ValueError("少なくとも1つの方位角を提供する必要があります")
     
-    total_steps = 1 + len(azimuth_list) + 1 + 1  # validation + hillshades + combine + finalize
+    # 処理ステップ: 検証(1) + 各方位での計算(n) + 合成(1) + 最終化(1)
+    total_steps = 1 + len(azimuth_list) + 1 + 1
     progress.set_range(total_steps)
     
-    # Input validation
-    progress.advance(1, "Validating inputs...")
+    # 入力検証
+    progress.advance(1, "入力を検証中...")
     
     if not isinstance(dem, np.ndarray):
-        raise TypeError("DEM must be a numpy array")
+        raise TypeError("DEMはnumpy配列である必要があります")
     
     if dem.ndim != 2:
-        raise ValueError("DEM must be a 2D array")
+        raise ValueError("DEMは2D配列である必要があります")
         
     if not np.issubdtype(dem.dtype, np.number):
-        raise TypeError("DEM must contain numeric values")
+        raise TypeError("DEMは数値を含む必要があります")
     
     if not (0 <= altitude_deg <= 90):
-        raise ValueError(f"Altitude must be in range [0, 90] degrees, got {altitude_deg}")
+        raise ValueError(f"高度角は[0, 90]度の範囲内である必要があります。{altitude_deg}が指定されました")
     
     if weight < 0:
-        warnings.warn("Negative weight may produce unexpected results", UserWarning)
+        warnings.warn("負の重みは予期しない結果を生成する可能性があります", UserWarning)
     
-    # Ensure DEM is float32 for consistency
-    dem_f32 = dem.astype(np.float32, copy=False)
+    # DEMがfloat32であることを保証
+    dem_processed = dem.astype(np.float32, copy=True)
     
-    # Compute individual hillshades
+    # NaN処理の適用
+    original_nan_mask = np.isnan(dem_processed)
+    
+    # set_nan処理：指定された値をNaNに設定
+    if set_nan is not None:
+        set_nan_mask = np.isclose(dem_processed, set_nan, equal_nan=False)
+        if np.any(set_nan_mask):
+            dem_processed[set_nan_mask] = np.nan
+            # 元のNaNマスクを更新
+            original_nan_mask = original_nan_mask | set_nan_mask
+    
+    # replace_nan処理：NaN値を一時的に置換
+    temp_nan_mask = np.isnan(dem_processed)
+    if replace_nan is not None and np.any(temp_nan_mask):
+        dem_processed[temp_nan_mask] = replace_nan
+    
+    # 個別ヒルシェードの計算
     shades = []
     total_azimuths = len(azimuth_list)
     
     for i, az in enumerate(azimuth_list):
-        step_text = f"Computing hillshade {i+1}/{total_azimuths} (azimuth {az}°)"
+        step_text = f"ヒルシェード計算中 {i+1}/{total_azimuths} (方位角 {az}°)"
         
         try:
-            # Create a sub-progress for this hillshade computation
-            # direct_light may also use progress, so we pass it through
-            shade = direct_light(
-                dem_f32,
+            shade = _compute_hillshade(
+                dem_processed,
                 azimuth_deg=float(az),
                 altitude_deg=altitude_deg,
                 cellsize=cellsize,
-                cast_shadows=cast_shadows,
-                max_shadow_radius=max_shadow_radius,
-                memory_efficient=memory_efficient,
-                progress=None  # Let direct_light handle its own progress if needed
+                memory_efficient=memory_efficient
             )
             shades.append(shade)
             
-            # Advance progress after completing this hillshade
+            # このヒルシェード完了後に進捗を進める
             progress.advance(1, step_text)
             
         except Exception as e:
-            raise RuntimeError(f"Failed to compute hillshade for azimuth {az}°: {e}") from e
+            raise RuntimeError(f"方位角{az}°のヒルシェード計算に失敗: {e}") from e
     
-    # Combine shades using mean
-    progress.advance(1, "Combining hillshades...")
+    # シェードの合成
+    progress.advance(1, "ヒルシェードを合成中...")
     
     if len(shades) == 1:
         composite = shades[0]
     else:
-        # Stack arrays for efficient mean computation
+        # 効率的な平均計算のために配列をスタック
         shade_stack = np.stack(shades, axis=0)
         composite = np.mean(shade_stack, axis=0)
     
-    # Apply weight
+    # 重みの適用
     if weight != 1.0:
         composite = composite * weight
     
-    # Optional normalization
+    # オプションの正規化
     if normalize_by_count and len(shades) > 1:
-        # Already normalized by np.mean, but ensure we maintain proper scaling
+        # np.meanによって既に正規化されているが、適切なスケーリングを保証
         pass
     
-    # Finalize result
-    progress.advance(1, "Finalizing result...")
+    # 結果の最終化
+    progress.advance(1, "結果を最終化中...")
     
-    # Ensure output is in [0,1] range and float32
+    # 元のNaN位置を復元
+    composite[original_nan_mask] = np.nan
+    
+    # 出力が[0,1]範囲でfloat32であることを保証
     result = np.clip(composite, 0.0, 1.0).astype(np.float32, copy=False)
     
-    # Mark completion
+    # 完了をマーク
     progress.done()
     
     return result
@@ -189,102 +288,95 @@ def swiss_shade(
 def estimate_swiss_memory(
     dem_shape: Tuple[int, int],
     n_azimuths: int = 4,
-    cast_shadows: bool = False,
-    max_shadow_radius: float = 100.0,
     cellsize: float = 1.0
 ) -> dict:
-    """Estimate memory usage for Swiss shading computation.
+    """
+    スイスシェーディング計算のメモリ使用量を推定
     
     Parameters
     ----------
     dem_shape : tuple of int
-        Shape of the DEM (height, width).
+        DEMの形状（高さ、幅）
     n_azimuths : int, default 4
-        Number of azimuth directions.
-    cast_shadows : bool, default False
-        Whether cast shadows will be computed.
-    max_shadow_radius : float, default 100.0
-        Shadow search radius (if applicable).
+        方位角方向数
     cellsize : float, default 1.0
-        Cell size for shadow computation.
+        セルサイズ
         
     Returns
     -------
     dict
-        Memory usage estimates in MB.
+        MB単位のメモリ使用量推定
         
     Examples
     --------
     >>> mem_info = estimate_swiss_memory((1000, 1000), n_azimuths=4)
-    >>> print(f"Estimated peak memory: {mem_info['peak_memory_mb']:.1f} MB")
+    >>> print(f"推定ピークメモリ: {mem_info['peak_memory_mb']:.1f} MB")
     """
     h, w = dem_shape
     total_pixels = h * w
     
-    # Base memory for DEM
+    # DEM用の基本メモリ
     dem_memory = total_pixels * 4 / 1024 / 1024  # float32
     
-    # Memory for individual shades (stored temporarily)
+    # 個別シェード用メモリ（一時的に保存）
     shade_memory = total_pixels * 4 / 1024 / 1024  # float32
     
-    # Memory for stacking operation
+    # スタッキング操作用メモリ
     stack_memory = n_azimuths * shade_memory
     
-    # Shadow computation memory (if enabled)
-    shadow_memory = 0
-    if cast_shadows:
-        from FujiShader.shader.sunsky import estimate_memory_usage
-        shadow_info = estimate_memory_usage(dem_shape, max_shadow_radius, cellsize)
-        shadow_memory = shadow_info['chunked_method_peak_mb']
-    
-    # Peak memory occurs during stacking operation
-    peak_memory = dem_memory + stack_memory + shadow_memory
+    # ピークメモリはスタッキング操作中に発生
+    peak_memory = dem_memory + stack_memory
     
     return {
         'dem_memory_mb': dem_memory,
         'single_shade_mb': shade_memory,
         'stack_memory_mb': stack_memory,
-        'shadow_memory_mb': shadow_memory,
         'peak_memory_mb': peak_memory,
         'n_azimuths': n_azimuths,
         'total_pixels': total_pixels,
-        'recommended_chunked': peak_memory > 500  # Recommend chunking if >500MB
+        'recommended_chunked': peak_memory > 500  # 500MB以上でチャンク処理を推奨
     }
 
 
-# Utility function for common Swiss shading configurations
 def swiss_shade_classic(
     dem: NDArray[np.float32],
     *,
     style: str = "imhof",
     cellsize: Union[float, Tuple[float, float]] = 1.0,
     intensity: float = 1.0,
+    set_nan: float = None,
+    replace_nan: float = None,
     progress: ProgressReporter = None
 ) -> NDArray[np.float32]:
-    """Classic Swiss shading configurations popularized by cartographers.
+    """
+    地図製作者によって普及された古典的なスイスシェーディング設定
     
     Parameters
     ----------
     dem : ndarray (H, W)
-        Digital elevation model.
+        デジタル標高モデル
     style : str, default "imhof"
-        Predefined style. Options:
-        - "imhof": Eduard Imhof's classic 4-direction setup
-        - "jenny": Bernhard Jenny's 3-direction variant
-        - "cardinal": Simple N-E-S-W configuration
+        事前定義スタイル。オプション:
+        - "imhof": Eduard Imhofの古典的4方向設定
+        - "jenny": Bernhard Jennyの3方向バリアント
+        - "cardinal": シンプルなN-E-S-W設定
     cellsize : float or tuple, default 1.0
-        Pixel size.
+        ピクセルサイズ
     intensity : float, default 1.0
-        Overall intensity multiplier.
+        全体強度乗数
+    set_nan : float, optional
+        この値をNaNに設定
+    replace_nan : float, optional
+        NaN値をこの値で置換
     progress : ProgressReporter, optional
-        Progress callback.
+        進捗コールバック
         
     Returns
     -------
     shade : ndarray (H, W) in [0,1]
-        Swiss hillshade using the specified classic configuration.
+        指定された古典設定を使用したスイスヒルシェード
     """
-    # Initialize progress if not provided
+    # 進捗が提供されていない場合は初期化
     if progress is None:
         progress = NullProgress()
     
@@ -305,13 +397,13 @@ def swiss_shade_classic(
     
     if style not in style_configs:
         available = ", ".join(style_configs.keys())
-        raise ValueError(f"Unknown style '{style}'. Available: {available}")
+        raise ValueError(f"不明なスタイル'{style}'。利用可能: {available}")
     
     config = style_configs[style]
     
-    # Set up progress for classic style
+    # 古典スタイル用の進捗設定
     progress.set_range(1)
-    progress.advance(1, f"Applying {style} Swiss shading style...")
+    progress.advance(1, f"{style}スイスシェーディングスタイルを適用中...")
     
     result = swiss_shade(
         dem,
@@ -319,7 +411,8 @@ def swiss_shade_classic(
         altitude_deg=config["altitude_deg"],
         cellsize=cellsize,
         weight=intensity,
-        cast_shadows=False,  # Classic Swiss shading doesn't use shadows
+        set_nan=set_nan,
+        replace_nan=replace_nan,
         progress=progress
     )
     

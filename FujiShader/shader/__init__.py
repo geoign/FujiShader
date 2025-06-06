@@ -1,16 +1,16 @@
 """
 FujiShader.shader
 =================
-Dynamic aggregator for all shading / terrain-analysis algorithms
-contained in this sub-package.
+このサブパッケージに含まれるすべてのシェーディング/地形解析アルゴリズムの
+動的アグリゲーター。
 
-* Any .py file whose name **doesn’t start with “_”** is imported.
-* Every public symbol declared in its ``__all__`` is
-  - injected into the shader namespace   →  ``import FujiShader.shader as fs``
-  - listed in ``list_algorithms()`` for GUI / CLI discovery.
+* ファイル名が**"_"で始まらない**すべての.pyファイルが自動インポートされます。
+* ``__all__``で宣言されたすべての公開シンボルは以下のように処理されます：
+  - shaderネームスペースに注入される   →  ``import FujiShader.shader as fs``
+  - GUI/CLI発見用の``list_algorithms()``にリストされる
 
-Add a new algorithm file (e.g. openness.py with ``__all__ = ["openness"]``)
-and it will appear automatically—no edit here required.
+新しいアルゴリズムファイル（例：``__all__ = ["openness"]``のopenness.py）を
+追加すると、自動的に表示されます—ここでの編集は不要です。
 """
 from __future__ import annotations
 
@@ -19,47 +19,48 @@ import pkgutil
 from types import ModuleType
 from typing import Callable, Dict
 
-__all__: list[str] = []          # re-exported callables
+__all__: list[str] = []          # 再エクスポートされる呼び出し可能オブジェクト
 _algorithms: Dict[str, Callable] = {}
 _modules: Dict[str, ModuleType] = {}
 
 # ---------------------------------------------------------------------------
-# auto-import every peer module whose filename doesn't start with "_"
+# ファイル名が"_"で始まらないすべてのピアモジュールを自動インポート
 # ---------------------------------------------------------------------------
 for modinfo in pkgutil.iter_modules(__path__, prefix=f"{__name__}."):
     if modinfo.ispkg or modinfo.name.rsplit('.', 1)[-1].startswith("_"):
-        continue  # skip sub-packages & private helpers
+        continue  # サブパッケージとプライベートヘルパーをスキップ
 
     module = importlib.import_module(modinfo.name)
     mod_short = module.__name__.split(".")[-1]
     _modules[mod_short] = module
 
-    # collect public symbols declared in submodule's __all__
+    # サブモジュールの__all__で宣言された公開シンボルを収集
     for sym in getattr(module, "__all__", []):
         obj = getattr(module, sym)
-        globals()[sym] = obj          # re-export at package level
+        globals()[sym] = obj          # パッケージレベルで再エクスポート
         __all__.append(sym)
         _algorithms[sym] = obj
 
 # ---------------------------------------------------------------------------
-# helper utilities
+# ヘルパーユーティリティ
 # ---------------------------------------------------------------------------
 def list_algorithms() -> Dict[str, Callable]:
     """
-    Return a *copy* of the {name: callable} registry.
+    {名前: 呼び出し可能オブジェクト}レジストリの*コピー*を返します。
 
-    Example
+    例
     -------
     >>> import FujiShader.shader as fs
     >>> fs.list_algorithms().keys()
     dict_keys(['topo_usm', 'multi_scale_usm',
                'warmcool_map',
                'slope',
-               'skyview_factor'])
+               'skyview_factor',
+               'ambient_occlusion'])
     """
     return _algorithms.copy()
 
 
 def list_modules() -> list[str]:
-    """Return the short names of the sub-modules currently loaded."""
+    """現在読み込まれているサブモジュールの短縮名を返します。"""
     return sorted(_modules.keys())
