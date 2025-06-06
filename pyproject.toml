@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "FujiShader"
-version = "0.1.10"
+version = "0.1.12"
 description = "Terrain shading library with warm-cool, AO, curvature, etc."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -26,6 +26,10 @@ extras = ["scipy>=1.10", "numba>=0.59"]
 
 [project.scripts]
 fujishader = "FujiShader.cli.shader_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["images", "images.*"]
 
 [project.urls]
 Homepage      = "https://github.com/yourusername/FujiShader"
