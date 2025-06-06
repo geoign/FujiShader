@@ -1,8 +1,7 @@
 # FujiShader 【富士シェーダー🌋】
 Advanced DEM visualization library.
-- Fast
-- Capable to process COG (Cloud Optimized GeoTIFF) in Gigabytes.
-- Some original shading methods
+- Capable to process COG (Cloud Optimized GeoTIFF) directly.
+- Some original cool shading methods
 
 ***!!! Currently in ALPHA !!!***
 
@@ -11,7 +10,7 @@ Advanced DEM visualization library.
 pip install git+https://github.com/geoign/FujiShader.git
 ```
 
-The development of QGIS module is in progress.
+The development of a QGIS plugin is in progress.
 
 ## Shaders
 Note that none of them are compatible to LatLon Grid... yet.
@@ -27,7 +26,6 @@ FujiShader DEM.tif SLOPE.tif --algo slope
     --replace-nan None (Replace NaN with certain value)
     --cellsize 1.0 (meter/pixel)
     --unit degrees (or percent)
-    --treat_nan None (Set this to replace NaN)
 
 ### Topographic Position Index
 ![TPI map](images/MtFuji_TPI.jpg)
@@ -40,7 +38,6 @@ FujiShader DEM.tif TPI.tif --algo tpi
     --replace-nan None (Replace NaN with certain value)
     --cellsize 1.0 (meter/pixel)
     --radius_m 100.0 (meters)
-    --treat_nan None (Set this to replace NaN)
     
 ### SkyView Factor
 ![Skyview Factor map](images/MtFuji_SVF.jpg)
@@ -110,7 +107,6 @@ FujiShader DEM.tif RV.tif --algo multi_scale_integral
     --replace-nan None (Replace NaN with certain value)
     --radii 4,16,64,256 (pixels range)
     --normalize True (Normalize to -1 ~ +1)
-    --treat_nan NaN (Replace NaN to this if set)
 
 ### RidgeVolley - BoxGauss method
 ![RidgeVolley map by BoxGauss method](images/MtFuji_RV2.jpg)
@@ -123,11 +119,10 @@ FujiShader DEM.tif RV.tif --algo multi_scale_boxgauss
     --replace-nan None (Replace NaN with certain value)
     --radii 4,16,64,256 (pixels range)
     --normalize True (Normalize to -1 ~ +1)
-    --treat_nan NaN (Replace NaN to this if set)
 
 ### RidgeVolley - TopoUSM method
 ![RidgeVolley map by TopoUSM method](images/MtFuji_RV3.jpg)
-Highlights ridges and shadows volleys. Ancient implementation by myself.
+Highlights ridges and shadows volleys. Slow implementation by myself.
 ```bash
 FujiShader DEM.tif RV.tif --algo multi_scale_usm
 ```
@@ -136,11 +131,10 @@ FujiShader DEM.tif RV.tif --algo multi_scale_usm
     --replace-nan None (Replace NaN with certain value)
     --radii 4,16,64,256 (pixels range)
     --normalize True (Normalize to -1 ~ +1)
-    --treat_nan NaN (Replace NaN to this if set)
     
 ### WarmCool Map
 ![WarmCool map](images/MtFuji_WMCL.jpg)
-Original shading method by myself based on vision science :D.
+Original shading method by myself based on vision science.
 ```bash
 FujiShader RV.tif WARMCOOL.tif --algo warmcool_map --slope SLOPE.tif --svf SVF.tif`
 ```
@@ -155,7 +149,7 @@ FujiShader RV.tif WARMCOOL.tif --algo warmcool_map --slope SLOPE.tif --svf SVF.t
 
 ### Ambient Occlusion
 ![Ambient Occlusion map](images/MtFuji_AO.jpg)
-Classic ambient occlusion effect.
+Ambient occlusion effect which is common in 3D modeling.
 ```bash
 FujiShader DEM.tif AO.tif --algo ambient_occlusion
 ```
@@ -186,7 +180,7 @@ FujiShader DEM.tif MS.tif --algo metallic_shade
 
 ### Sunlight
 ![Map with the sunlight effect](images/MtFuji_SL1.jpg)
-Lambertian hillshade with optional cast shadows
+Lambertian hillshade with optional cast shadows.
 ```bash
 FujiShader DEM.tif DL.tif --algo direct_light
 ```
